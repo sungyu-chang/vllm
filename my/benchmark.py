@@ -168,11 +168,19 @@ def run_benchmark(
 
     current = min_length
 
-    while current <= max_length:
+    while current < max_length:
 
         prompt_lengths.append(current)
 
         current *= 2
+
+
+
+    # Always include max_length (even if not a power of 2)
+
+    if not prompt_lengths or prompt_lengths[-1] != max_length:
+
+        prompt_lengths.append(max_length)
 
 
 
@@ -539,6 +547,7 @@ def main():
         api_key=args.api_key
 
     )
+
 
 
     # Save results
