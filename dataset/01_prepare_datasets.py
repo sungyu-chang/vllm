@@ -22,6 +22,7 @@ import re
 from pathlib import Path
 
 from datasets import load_dataset, get_dataset_config_names
+from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 
@@ -187,27 +188,50 @@ def load_sharegpt(max_samples: int) -> list[dict]:
 
 
 def load_leval(max_samples: int) -> list[dict]:
-    """Load L-Eval across all available configs."""
+    """Load L-Eval by fetching JSONL files directly (bypasses deprecated loading script)."""
     print("Loading L-Eval...")
-    try:
-        configs = get_dataset_config_names("L4NLP/LEval")
-    except Exception:
-        configs = ["default"]
 
+    # Map config name -> file path inside the L4NLP/LEval HF repo.
+    # Derived from LEval.py in the repo; avoids the now-unsupported script loader.
+    LEVAL_CONFIGS = {
+        # Closed-ended (Exam)
+        "coursera":                 "LEval/Exam/coursera.jsonl",
+        "gsm100":                   "LEval/Exam/gsm100.jsonl",
+        "quality":                  "LEval/Exam/quality.jsonl",
+        "topic_retrieval_longchat": "LEval/Exam/topic_retrieval_longchat.jsonl",
+        "tpo":                      "LEval/Exam/tpo.jsonl",
+        "sci_fi":                   "LEval/Exam/sci_fi.jsonl",
+        "codeU":                    "LEval/Exam/codeU.jsonl",
+        # Open-ended (Generation)
+        "financial_qa":             "LEval/Generation/financial_qa.jsonl",
+        "gov_report_summ":          "LEval/Generation/gov_report_summ.jsonl",
+        "legal_contract_qa":        "LEval/Generation/legal_contract_qa.jsonl",
+        "meeting_summ":             "LEval/Generation/meeting_summ.jsonl",
+        "multidoc_qa":              "LEval/Generation/multidoc_qa.jsonl",
+        "narrative_qa":             "LEval/Generation/narrative_qa.jsonl",
+        "natural_question":         "LEval/Generation/natural_question.jsonl",
+        "news_summ":                "LEval/Generation/news_summ.jsonl",
+        "paper_assistant":          "LEval/Generation/paper_assistant.jsonl",
+        "patent_summ":              "LEval/Generation/patent_summ.jsonl",
+        "review_summ":              "LEval/Generation/review_summ.jsonl",
+        "scientific_qa":            "LEval/Generation/scientific_qa.jsonl",
+        "tv_show_summ":             "LEval/Generation/tv_show_summ.jsonl",
+    }
+
+    per_config = max(1, max_samples // len(LEVAL_CONFIGS))
     records = []
-    per_config = max(1, max_samples // max(len(configs), 1))
 
-    for cfg in configs:
+    for cfg, filepath in LEVAL_CONFIGS.items():
         try:
-            ds = load_dataset("L4NLP/LEval", cfg, split="test", trust_remote_code=True)
-        except Exception:
-            try:
-                ds = load_dataset("L4NLP/LEval", cfg, trust_remote_code=True)
-                # take the first available split
-                ds = ds[list(ds.keys())[0]]
-            except Exception as e:
-                print(f"  Skipping L-Eval config '{cfg}': {e}")
-                continue
+            local_path = hf_hub_download(
+                repo_id="L4NLP/LEval",
+                filename=filepath,
+                repo_type="dataset",
+            )
+            ds = load_dataset("json", data_files=local_path, split="train")
+        except Exception as e:
+            print(f"  Skipping L-Eval config '{cfg}': {e}")
+            continue
 
         for i, row in enumerate(tqdm(ds, desc=f"L-Eval/{cfg}", total=min(per_config, len(ds)))):
             if i >= per_config:
