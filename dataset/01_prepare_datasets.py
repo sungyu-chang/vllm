@@ -10,10 +10,11 @@ Each output record has:
   original_id  - the id string from the source dataset, or None
 
 Usage:
-  python 01_prepare_datasets.py --output combined_dataset.jsonl [--max_samples N]
+  python 01_prepare_datasets.py --output combined_dataset.jsonl
+  python 01_prepare_datasets.py --output combined_dataset.jsonl --max_samples 200
 
 Dependencies:
-  pip install datasets tqdm
+  pip install datasets huggingface_hub tqdm
 """
 
 import argparse
@@ -168,18 +169,22 @@ def _fmt_loogle(row: dict, index: int, config_name: str = ""):
 # Dataset loading helpers
 # ---------------------------------------------------------------------------
 
-def load_sharegpt(max_samples: int) -> list[dict]:
+def _tqdm_total(ds, limit):
+    """Return tqdm total: dataset length when no limit, else min(limit, len)."""
+    return len(ds) if limit is None else min(limit, len(ds))
+
+
+def load_sharegpt(max_samples: int | None) -> list[dict]:
     """Load ShareGPT Vicuna unfiltered dataset."""
     print("Loading ShareGPT...")
-    # This dataset has a file called ShareGPT90K; try the default config
     ds = load_dataset(
         "anon8231489123/ShareGPT_Vicuna_unfiltered",
         data_files="ShareGPT_V3_unfiltered_cleaned_split.json",
         split="train",
     )
     records = []
-    for i, row in enumerate(tqdm(ds, desc="ShareGPT", total=min(max_samples, len(ds)))):
-        if i >= max_samples:
+    for i, row in enumerate(tqdm(ds, desc="ShareGPT", total=_tqdm_total(ds, max_samples))):
+        if max_samples is not None and i >= max_samples:
             break
         rec = _fmt_sharegpt(row, i)
         if rec["input"].strip():
@@ -187,7 +192,7 @@ def load_sharegpt(max_samples: int) -> list[dict]:
     return records
 
 
-def load_leval(max_samples: int) -> list[dict]:
+def load_leval(max_samples: int | None) -> list[dict]:
     """Load L-Eval by fetching JSONL files directly (bypasses deprecated loading script)."""
     print("Loading L-Eval...")
 
@@ -218,7 +223,10 @@ def load_leval(max_samples: int) -> list[dict]:
         "tv_show_summ":             "LEval/Generation/tv_show_summ.jsonl",
     }
 
-    per_config = max(1, max_samples // len(LEVAL_CONFIGS))
+    per_config = (
+        None if max_samples is None
+        else max(1, max_samples // len(LEVAL_CONFIGS))
+    )
     records = []
 
     for cfg, filepath in LEVAL_CONFIGS.items():
@@ -233,8 +241,8 @@ def load_leval(max_samples: int) -> list[dict]:
             print(f"  Skipping L-Eval config '{cfg}': {e}")
             continue
 
-        for i, row in enumerate(tqdm(ds, desc=f"L-Eval/{cfg}", total=min(per_config, len(ds)))):
-            if i >= per_config:
+        for i, row in enumerate(tqdm(ds, desc=f"L-Eval/{cfg}", total=_tqdm_total(ds, per_config))):
+            if per_config is not None and i >= per_config:
                 break
             rec = _fmt_leval(row, i, config_name=cfg)
             if rec["input"].strip():
@@ -243,13 +251,13 @@ def load_leval(max_samples: int) -> list[dict]:
     return records
 
 
-def load_longbench2(max_samples: int) -> list[dict]:
+def load_longbench2(max_samples: int | None) -> list[dict]:
     """Load LongBench-v2."""
     print("Loading LongBench-v2...")
     ds = load_dataset("zai-org/LongBench-v2", split="train", trust_remote_code=True)
     records = []
-    for i, row in enumerate(tqdm(ds, desc="LongBench-v2", total=min(max_samples, len(ds)))):
-        if i >= max_samples:
+    for i, row in enumerate(tqdm(ds, desc="LongBench-v2", total=_tqdm_total(ds, max_samples))):
+        if max_samples is not None and i >= max_samples:
             break
         rec = _fmt_longbench2(row, i)
         if rec["input"].strip():
@@ -257,7 +265,7 @@ def load_longbench2(max_samples: int) -> list[dict]:
     return records
 
 
-def load_lmsys(max_samples: int) -> list[dict]:
+def load_lmsys(max_samples: int | None) -> list[dict]:
     """Load lmsys-chat-1m (requires HuggingFace login)."""
     print("Loading lmsys-chat-1m...")
     ds = load_dataset(
@@ -266,8 +274,8 @@ def load_lmsys(max_samples: int) -> list[dict]:
         trust_remote_code=True,
     )
     records = []
-    for i, row in enumerate(tqdm(ds, desc="lmsys-chat-1m", total=min(max_samples, len(ds)))):
-        if i >= max_samples:
+    for i, row in enumerate(tqdm(ds, desc="lmsys-chat-1m", total=_tqdm_total(ds, max_samples))):
+        if max_samples is not None and i >= max_samples:
             break
         rec = _fmt_lmsys(row, i)
         if rec["input"].strip():
@@ -275,7 +283,7 @@ def load_lmsys(max_samples: int) -> list[dict]:
     return records
 
 
-def load_loogle(max_samples: int) -> list[dict]:
+def load_loogle(max_samples: int | None) -> list[dict]:
     """Load LooGLE across all available configs."""
     print("Loading LooGLE...")
     try:
@@ -283,8 +291,11 @@ def load_loogle(max_samples: int) -> list[dict]:
     except Exception:
         configs = ["default"]
 
+    per_config = (
+        None if max_samples is None
+        else max(1, max_samples // max(len(configs), 1))
+    )
     records = []
-    per_config = max(1, max_samples // max(len(configs), 1))
 
     for cfg in configs:
         try:
@@ -297,8 +308,8 @@ def load_loogle(max_samples: int) -> list[dict]:
                 print(f"  Skipping LooGLE config '{cfg}': {e}")
                 continue
 
-        for i, row in enumerate(tqdm(ds, desc=f"LooGLE/{cfg}", total=min(per_config, len(ds)))):
-            if i >= per_config:
+        for i, row in enumerate(tqdm(ds, desc=f"LooGLE/{cfg}", total=_tqdm_total(ds, per_config))):
+            if per_config is not None and i >= per_config:
                 break
             rec = _fmt_loogle(row, i, config_name=cfg)
             if rec["input"].strip():
@@ -318,8 +329,8 @@ def main():
         help="Output JSONL file path (default: combined_dataset.jsonl)",
     )
     parser.add_argument(
-        "--max_samples", type=int, default=200,
-        help="Max samples per dataset (default: 200)",
+        "--max_samples", type=int, default=None,
+        help="Max samples per dataset; omit to load all records (default: all)",
     )
     parser.add_argument(
         "--datasets", nargs="+",
