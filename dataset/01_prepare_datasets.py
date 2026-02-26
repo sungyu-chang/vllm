@@ -132,25 +132,14 @@ def _fmt_lmsys(row: dict, index: int):
 
 def _fmt_loogle(row: dict, index: int, config_name: str = ""):
     """
-    LooGLE: long document + optional QA pairs.
-    Fields: input (doc), output, qa_pairs (JSON string), title, type.
-    For QA subsets we append the first question; for summarization just the doc.
+    LooGLE: long document + optional question.
+    Parquet fields: context (doc), question, answer, title.
     """
-    doc = row.get("input", "").strip()
-    qa_pairs_raw = row.get("qa_pairs", "")
+    doc = row.get("context", "").strip()
+    question = row.get("question", "").strip()
 
-    # Try to extract the first question from qa_pairs (JSON string)
-    first_q = ""
-    if qa_pairs_raw:
-        try:
-            pairs = json.loads(qa_pairs_raw)
-            if isinstance(pairs, list) and pairs:
-                first_q = pairs[0].get("Q", "") or pairs[0].get("question", "")
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    if first_q:
-        combined = f"{doc}\n\nQuestion: {first_q.strip()}"
+    if question:
+        combined = f"{doc}\n\nQuestion: {question}"
     else:
         combined = doc
 
@@ -299,10 +288,10 @@ def load_loogle(max_samples: int | None) -> list[dict]:
 
     for cfg in configs:
         try:
-            ds = load_dataset("bigai-nlco/LooGLE", cfg, split="test", trust_remote_code=True)
+            ds = load_dataset("bigai-nlco/LooGLE", cfg, split="test")
         except Exception:
             try:
-                ds = load_dataset("bigai-nlco/LooGLE", cfg, trust_remote_code=True)
+                ds = load_dataset("bigai-nlco/LooGLE", cfg)
                 ds = ds[list(ds.keys())[0]]
             except Exception as e:
                 print(f"  Skipping LooGLE config '{cfg}': {e}")
