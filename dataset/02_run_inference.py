@@ -16,13 +16,30 @@ Output log format (JSONL, one line per sample):
     "num_layers":       int,   # number of MoE layers captured
     "topk":             int,   # top-k experts per token per layer
     "experts_shape":   [int, int, int],  # [total_tokens, num_layers, topk]
-    "experts":         [[[int]]],        # nested list [token][layer][k] -> expert ID
+    "experts_b64":      str,   # base64-encoded int32 numpy array (C order)
   }
 
-Decode experts:
-  import numpy as np
-  arr = np.array(rec["experts"], dtype=np.int32)
+Decode experts_b64:
+  import base64, numpy as np
+  arr = np.frombuffer(base64.b64decode(rec["experts_b64"]), dtype=np.int32)
+  arr = arr.reshape(rec["experts_shape"])
   # arr[token_pos, layer_idx, k] -> expert ID
+
+How expert logging works
+------------------------
+vLLM is initialised with enable_return_routed_experts=True.  Inside each
+FusedMoE layer, after the router softmax selects the top-k expert indices for
+every token, vLLM stores those indices in a thread-local buffer attached to
+the RequestOutput.  After generation completes, completion.routed_experts is a
+numpy array of shape [total_tokens, num_layers, topk] where:
+  - total_tokens  = num_prompt_tokens + num_output_tokens
+  - num_layers    = number of MoE layers in the model
+  - topk          = experts selected per token per layer (model-specific, e.g. 2)
+  - values        = integer expert IDs (0-based)
+The array covers both the prefill pass (prompt tokens) and the decode pass
+(generated tokens), so each row corresponds to one token position in the full
+sequence.  The script encodes the array as base64(int32 bytes) for compact
+storage, ~4 bytes per expert ID vs ~3 bytes as ASCII digits.
 
 Usage:
   python 02_run_inference.py \\
@@ -38,12 +55,18 @@ Dependencies:
 """
 
 import argparse
+import base64
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 from vllm import LLM, SamplingParams
 
+
+def encode_experts(arr: np.ndarray) -> str:
+    """Encode a numpy int32 array to a base64 string for compact storage."""
+    return base64.b64encode(arr.astype(np.int32).tobytes()).decode("ascii")
 
 
 def load_dataset(path: str) -> list[dict]:
@@ -60,6 +83,14 @@ def load_dataset(path: str) -> list[dict]:
 def truncate_input(text: str, max_chars: int) -> str:
     """Hard-truncate by character count as a pre-tokenisation safety guard."""
     return text[:max_chars]
+
+
+def fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as H:MM:SS."""
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    s = int(seconds) % 60
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 def main():
@@ -135,9 +166,12 @@ def main():
     # ------------------------------------------------------------------
     # Inference loop  – one prompt at a time for simple, deterministic logs
     # ------------------------------------------------------------------
+    total = len(records)
     out_path = Path(args.output)
+    loop_start = time.monotonic()
+
     with out_path.open("a", encoding="utf-8") as log_file:
-        for rec in records:
+        for i, rec in enumerate(records):
             sample_id = rec["id"]
             dataset_name = rec["dataset_name"]
             prompt = truncate_input(rec["input"], args.max_input_tokens * 4)
@@ -170,7 +204,7 @@ def main():
                     "num_layers": None,
                     "topk": None,
                     "experts_shape": None,
-                    "experts": None,
+                    "experts_b64": None,
                 }
             else:
                 total_tokens, num_layers, topk = routed_experts.shape
@@ -183,16 +217,23 @@ def main():
                     "num_layers": num_layers,
                     "topk": topk,
                     "experts_shape": list(routed_experts.shape),
-                    "experts": routed_experts.tolist(),
+                    # Compact binary encoding: base64(int32 bytes, C order)
+                    "experts_b64": encode_experts(routed_experts),
                 }
 
             log_file.write(json.dumps(entry) + "\n")
             log_file.flush()
 
+            # Progress + ETA
+            done = i + 1
+            elapsed = time.monotonic() - loop_start
+            avg_per_sample = elapsed / done
+            eta = avg_per_sample * (total - done)
             print(
-                f"[{sample_id}] prompt_tokens={entry['num_prompt_tokens']}, "
-                f"output_tokens={entry['num_output_tokens']}, "
-                f"experts_shape={entry['experts_shape']}"
+                f"[{done}/{total}] {sample_id} | "
+                f"prompt={entry['num_prompt_tokens']} gen={entry['num_output_tokens']} "
+                f"experts={entry['experts_shape']} | "
+                f"elapsed={fmt_duration(elapsed)} eta={fmt_duration(eta)}"
             )
 
     print(f"\nDone. Logs written to {out_path}")
