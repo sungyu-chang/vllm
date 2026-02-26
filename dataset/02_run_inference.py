@@ -16,13 +16,12 @@ Output log format (JSONL, one line per sample):
     "num_layers":       int,   # number of MoE layers captured
     "topk":             int,   # top-k experts per token per layer
     "experts_shape":   [int, int, int],  # [total_tokens, num_layers, topk]
-    "experts_b64":      str,   # base64-encoded int32 numpy array (C order)
+    "experts":         [[[int]]],        # nested list [token][layer][k] -> expert ID
   }
 
-Decode experts_b64:
-  import base64, numpy as np
-  arr = np.frombuffer(base64.b64decode(rec["experts_b64"]), dtype=np.int32)
-  arr = arr.reshape(rec["experts_shape"])
+Decode experts:
+  import numpy as np
+  arr = np.array(rec["experts"], dtype=np.int32)
   # arr[token_pos, layer_idx, k] -> expert ID
 
 Usage:
@@ -39,17 +38,12 @@ Dependencies:
 """
 
 import argparse
-import base64
 import json
 from pathlib import Path
 
 import numpy as np
 from vllm import LLM, SamplingParams
 
-
-def encode_experts(arr: np.ndarray) -> str:
-    """Encode a numpy int32 array to a base64 string for compact storage."""
-    return base64.b64encode(arr.astype(np.int32).tobytes()).decode("ascii")
 
 
 def load_dataset(path: str) -> list[dict]:
@@ -176,7 +170,7 @@ def main():
                     "num_layers": None,
                     "topk": None,
                     "experts_shape": None,
-                    "experts_b64": None,
+                    "experts": None,
                 }
             else:
                 total_tokens, num_layers, topk = routed_experts.shape
@@ -189,8 +183,7 @@ def main():
                     "num_layers": num_layers,
                     "topk": topk,
                     "experts_shape": list(routed_experts.shape),
-                    # Compact binary encoding: base64(int32 bytes, C order)
-                    "experts_b64": encode_experts(routed_experts),
+                    "experts": routed_experts.tolist(),
                 }
 
             log_file.write(json.dumps(entry) + "\n")
