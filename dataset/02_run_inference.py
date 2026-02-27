@@ -161,6 +161,13 @@ def main():
 
     tokenizer = llm.get_tokenizer()
 
+    # Extract shared/routed expert counts from the model config so they can be
+    # stored in every log record.  These are DeepSeek-specific fields; other
+    # MoE models that don't have them will get None / 0 gracefully.
+    hf_config = llm.llm_engine.model_config.hf_config
+    n_routed_experts: int | None = getattr(hf_config, "n_routed_experts", None)
+    n_shared_experts: int = int(getattr(hf_config, "n_shared_experts", 0) or 0)
+
     sampling_params = SamplingParams(
         max_tokens=args.max_output_tokens,
         temperature=0.0,  # greedy for reproducibility
@@ -207,6 +214,8 @@ def main():
                     "num_prompt_tokens": num_prompt_tokens,
                     "num_output_tokens": num_output_tokens,
                     "total_tokens": num_prompt_tokens + num_output_tokens,
+                    "n_routed_experts": n_routed_experts,
+                    "n_shared_experts": n_shared_experts,
                     "num_layers": None,
                     "topk": None,
                     "experts_shape": None,
@@ -220,6 +229,12 @@ def main():
                     "num_prompt_tokens": num_prompt_tokens,
                     "num_output_tokens": num_output_tokens,
                     "total_tokens": total_tokens,
+                    # n_routed_experts: number of dynamically-routed experts;
+                    #   expert IDs in experts_b64 are in [0, n_routed_experts).
+                    # n_shared_experts: always-active experts (DeepSeek-style);
+                    #   these are NOT captured here — they fire on every token.
+                    "n_routed_experts": n_routed_experts,
+                    "n_shared_experts": n_shared_experts,
                     "num_layers": num_layers,
                     "topk": topk,
                     "experts_shape": list(routed_experts.shape),
