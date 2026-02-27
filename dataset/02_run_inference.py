@@ -177,7 +177,8 @@ def main():
         for i, rec in enumerate(records):
             sample_id = rec["id"]
             dataset_name = rec["dataset_name"]
-            token_ids = truncate_to_tokens(rec["input"], tokenizer, args.max_input_tokens)
+            max_prompt_tokens = args.max_input_tokens - args.max_output_tokens
+            token_ids = truncate_to_tokens(rec["input"], tokenizer, max_prompt_tokens)
 
             # Generate one sample; returns a list with one RequestOutput
             outputs = llm.generate(
