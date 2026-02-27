@@ -80,9 +80,10 @@ def load_dataset(path: str) -> list[dict]:
     return records
 
 
-def truncate_input(text: str, max_chars: int) -> str:
-    """Hard-truncate by character count as a pre-tokenisation safety guard."""
-    return text[:max_chars]
+def truncate_to_tokens(text: str, tokenizer, max_tokens: int) -> list[int]:
+    """Tokenize text and hard-truncate to max_tokens token IDs."""
+    token_ids = tokenizer.encode(text)
+    return token_ids[:max_tokens]
 
 
 def fmt_duration(seconds: float) -> str:
@@ -158,6 +159,8 @@ def main():
         enforce_eager=True,
     )
 
+    tokenizer = llm.get_tokenizer()
+
     sampling_params = SamplingParams(
         max_tokens=args.max_output_tokens,
         temperature=0.0,  # greedy for reproducibility
@@ -174,10 +177,12 @@ def main():
         for i, rec in enumerate(records):
             sample_id = rec["id"]
             dataset_name = rec["dataset_name"]
-            prompt = truncate_input(rec["input"], args.max_input_tokens * 4)
+            token_ids = truncate_to_tokens(rec["input"], tokenizer, args.max_input_tokens)
 
             # Generate one sample; returns a list with one RequestOutput
-            outputs = llm.generate([prompt], sampling_params, use_tqdm=False)
+            outputs = llm.generate(
+                [{"prompt_token_ids": token_ids}], sampling_params, use_tqdm=False
+            )
             request_output = outputs[0]
             completion = request_output.outputs[0]
 
