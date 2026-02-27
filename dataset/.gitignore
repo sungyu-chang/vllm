@@ -1,0 +1,10 @@
+# Jupyter notebooks — tracked as 03_analysis.py instead
+*.ipynb
+
+# Generated outputs
+*.jsonl
+expert_selection_report.pdf
+fig_*.png
+fig_*.pdf
+layer_figures/
+layer_cdfs/
