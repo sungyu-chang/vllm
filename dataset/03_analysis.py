@@ -4,7 +4,7 @@
 # Analyses the expert routing logs produced by `02_run_inference.py`.
 #
 # ## Log format recap
-# Each line in `expert_log.jsonl` is a JSON object:
+# Each line in `expert_log_{model_name}.jsonl` is a JSON object:
 # ```
 # {
 #   id, dataset_name, num_prompt_tokens, num_output_tokens,
@@ -14,28 +14,39 @@
 # }
 # ```
 #
-# ## Figures produced
-# 1. **Aggregated CDF of expert choice across datasets** (one line per dataset)
-# 2. **Aggregated CDF of expert choice at a specific layer** (one line per dataset, configurable layer ID)
+# ## Analyses produced
+# 1. **Aggregated CDF / PMF of expert choice across datasets**
+# 2. **Per-layer CDF / PMF figures**
+# 3. **KL divergence** — pairwise comparison of PMFs (overall + per layer)
+# 4. **Expert continuity** — PMF of consecutive-layer run lengths per dataset
 
 # %%
 import base64
 import json
+import sys
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-
-# ── Configuration ────────────────────────────────────────────────────────────
-LOG_FILE = "expert_log_deepseek.jsonl"   # produced by 02_run_inference.py
-LAYER_ID = 0                    # change to inspect a different layer (3-2)
-# ─────────────────────────────────────────────────────────────────────────────
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from cycler import cycler
 import pathlib, textwrap
+
+# ── Configuration ────────────────────────────────────────────────────────────
+MODEL_NAME = "default_model"      # ← set your model name here
+# Override from command line:  python 03_analysis.py <model_name>
+if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+    MODEL_NAME = sys.argv[1]
+
+LOG_FILE = f"expert_log_{MODEL_NAME}.jsonl"
+LAYER_ID = 0                      # change to inspect a different layer (3-2)
+
+OUT_DIR = Path(f"figures_{MODEL_NAME}")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── Inline style (academic.mplstyle) ────────────────────────────────────────
 _STYLE = textwrap.dedent("""
@@ -128,6 +139,11 @@ PAIRED    = [BLUE_LT, BLUE_DK, GREEN_LT, GREEN_DK, RED_LT, RED_DK,
 MARKERS    = ["s", "D", "^", "d", "o", "v", "P", "X"]
 LINESTYLES = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
 
+
+print(f"Model:      {MODEL_NAME}")
+print(f"Log file:   {LOG_FILE}")
+print(f"Output dir: {OUT_DIR}/")
+print()
 
 # %% [markdown]
 # ## 1. Load and decode the log file
@@ -290,6 +306,115 @@ def add_shared_expert_footnote(fig, n_shared: int) -> None:
     fig.subplots_adjust(bottom=0.12)
 
 # %% [markdown]
+# ## 2. KL Divergence Analysis
+#
+# Compare expert selection PMFs between datasets using symmetric
+# KL divergence: SKL(P, Q) = (KL(P‖Q) + KL(Q‖P)) / 2.
+#
+# Reported for: (a) overall distribution across all layers, and
+# (b) per-layer distributions with a heatmap summary.
+
+# %%
+def kl_divergence(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-12) -> float:
+    """KL(P ‖ Q) with additive smoothing to avoid log(0)."""
+    p = np.asarray(p, dtype=np.float64) + epsilon
+    q = np.asarray(q, dtype=np.float64) + epsilon
+    p = p / p.sum()
+    q = q / q.sum()
+    return float(np.sum(p * np.log(p / q)))
+
+
+def symmetric_kl(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-12) -> float:
+    """Symmetric KL divergence: (KL(P‖Q) + KL(Q‖P)) / 2."""
+    return (kl_divergence(p, q, epsilon) + kl_divergence(q, p, epsilon)) / 2.0
+
+
+def pad_to_same_length(*arrays: np.ndarray) -> list[np.ndarray]:
+    """Zero-pad arrays so they all share the same length."""
+    max_len = max(len(a) for a in arrays)
+    return [np.pad(a, (0, max_len - len(a))) if len(a) < max_len else a
+            for a in arrays]
+
+
+# ── 2a. Overall pairwise KL ─────────────────────────────────────────────────
+dataset_names = list(by_dataset.keys())
+
+if len(dataset_names) >= 2:
+    dataset_pmfs_overall: dict[str, np.ndarray] = {}
+    for name, arrays in by_dataset.items():
+        counts = expert_counts_all_layers(arrays)
+        _, pmf = counts_to_pmf(counts)
+        dataset_pmfs_overall[name] = pmf
+
+    pairs = list(combinations(dataset_names, 2))
+
+    print("=" * 65)
+    print("Pairwise Symmetric KL Divergence  (all layers aggregated)")
+    print("=" * 65)
+    for a, b in pairs:
+        pa, pb = pad_to_same_length(dataset_pmfs_overall[a],
+                                    dataset_pmfs_overall[b])
+        skl = symmetric_kl(pa, pb)
+        if skl >= 0.1:
+            flag = "  *** significant"
+        elif skl >= 0.01:
+            flag = "  *   moderate"
+        else:
+            flag = ""
+        print(f"  {a:20s} vs {b:20s}:  SKL = {skl:.6f}{flag}")
+    print()
+else:
+    pairs = []
+    print("(Only one dataset — skipping pairwise KL comparison.)\n")
+
+# ── 2b. Per-layer pairwise KL + heatmap ─────────────────────────────────────
+all_arrays = [a for arrs in by_dataset.values() for a in arrs]
+
+if len(pairs) > 0 and all_arrays:
+    num_layers = max(a.shape[1] for a in all_arrays)
+    kl_matrix = np.zeros((len(pairs), num_layers))
+
+    for i, (a, b) in enumerate(pairs):
+        for layer in range(num_layers):
+            ca = expert_counts_one_layer(by_dataset[a], layer)
+            cb = expert_counts_one_layer(by_dataset[b], layer)
+            _, pa = counts_to_pmf(ca)
+            _, pb = counts_to_pmf(cb)
+            if len(pa) == 0 or len(pb) == 0:
+                continue
+            pa, pb = pad_to_same_length(pa, pb)
+            kl_matrix[i, layer] = symmetric_kl(pa, pb)
+
+    print("Per-layer Symmetric KL Divergence")
+    print("-" * 65)
+    for i, (a, b) in enumerate(pairs):
+        row = kl_matrix[i]
+        sig_layers = np.where(row >= 0.1)[0]
+        mod_layers = np.where((row >= 0.01) & (row < 0.1))[0]
+        print(f"  {a} vs {b}:")
+        print(f"    Mean SKL = {row.mean():.6f},  "
+              f"Max SKL = {row.max():.6f} (layer {row.argmax()})")
+        if len(sig_layers) > 0:
+            print(f"    Significant layers (SKL >= 0.1): {sig_layers.tolist()}")
+        if len(mod_layers) > 0:
+            print(f"    Moderate layers  (0.01 <= SKL < 0.1): {mod_layers.tolist()}")
+    print()
+
+    # Heatmap
+    fig, ax = plt.subplots(
+        figsize=(max(10, num_layers * 0.3), max(3, len(pairs) * 0.8 + 1.5)))
+    im = ax.imshow(kl_matrix, aspect="auto", cmap="YlOrRd")
+    ax.set_xlabel("Layer", fontsize=12)
+    ax.set_ylabel("Dataset pair", fontsize=12)
+    ax.set_yticks(range(len(pairs)))
+    ax.set_yticklabels([f"{a} vs {b}" for a, b in pairs], fontsize=9)
+    ax.set_title(f"Per-layer Symmetric KL Divergence — {MODEL_NAME}", fontsize=13)
+    fig.colorbar(im, ax=ax, label="Symmetric KL")
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fig_kl_per_layer_heatmap.png", dpi=150)
+    plt.show()
+
+# %% [markdown]
 # ## 3-1. Aggregated CDF of expert choice across all layers (one line per dataset)
 
 # %%
@@ -312,8 +437,7 @@ ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 ax.grid(True, linestyle="--", alpha=0.4)
 add_shared_expert_footnote(fig, N_SHARED)
 fig.tight_layout()
-plt.savefig("fig_cdf_all_layers.png", dpi=150)
-plt.savefig("fig_cdf_all_layers.pdf")
+plt.savefig(OUT_DIR / "fig_cdf_all_layers.png", dpi=150)
 plt.show()
 
 # %% [markdown]
@@ -339,8 +463,7 @@ ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 ax.grid(True, linestyle="--", alpha=0.4)
 add_shared_expert_footnote(fig, N_SHARED)
 fig.tight_layout()
-plt.savefig(f"fig_cdf_layer{LAYER_ID}.png", dpi=150)
-plt.savefig(f"fig_cdf_layer{LAYER_ID}.pdf")
+plt.savefig(OUT_DIR / f"fig_cdf_layer{LAYER_ID}.png", dpi=150)
 plt.show()
 
 # %% [markdown]
@@ -372,8 +495,7 @@ ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 ax.grid(True, linestyle="--", alpha=0.4)
 add_shared_expert_footnote(fig, N_SHARED)
 fig.tight_layout()
-plt.savefig("fig_pmf_all_layers.png", dpi=150)
-plt.savefig("fig_pmf_all_layers.pdf")
+plt.savefig(OUT_DIR / "fig_pmf_all_layers.png", dpi=150)
 plt.show()
 
 # %% [markdown]
@@ -406,8 +528,7 @@ ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 ax.grid(True, linestyle="--", alpha=0.4)
 add_shared_expert_footnote(fig, N_SHARED)
 fig.tight_layout()
-plt.savefig(f"fig_pmf_layer{LAYER_ID}.png", dpi=150)
-plt.savefig(f"fig_pmf_layer{LAYER_ID}.pdf")
+plt.savefig(OUT_DIR / f"fig_pmf_layer{LAYER_ID}.png", dpi=150)
 plt.show()
 
 # %% [markdown]
@@ -438,8 +559,7 @@ ax_pmf.set_ylim(bottom=0)
 ax_pmf.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 ax_pmf.grid(True, linestyle="--", alpha=0.4)
 fig_pmf.tight_layout()
-fig_pmf.savefig("fig_pmf_all_layers_v2.png", dpi=150)
-fig_pmf.savefig("fig_pmf_all_layers_v2.pdf")
+fig_pmf.savefig(OUT_DIR / "fig_pmf_all_layers_v2.png", dpi=150)
 plt.show()
 
 # ── Absolute count: scatter dot figure ───────────────────────────────────────
@@ -467,14 +587,13 @@ ax_cnt.set_ylim(bottom=0)
 ax_cnt.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
 ax_cnt.grid(True, linestyle="--", alpha=0.4)
 fig_cnt.tight_layout()
-fig_cnt.savefig("fig_count_all_layers.png", dpi=150)
-fig_cnt.savefig("fig_count_all_layers.pdf")
+fig_cnt.savefig(OUT_DIR / "fig_count_all_layers.png", dpi=150)
 plt.show()
 
 # %% [markdown]
 # ## 4-4. Per-layer PMF (line) and absolute count (scatter) — saved to `layer_figures/`
 #
-# One PMF figure and one count figure per layer, both saved as PNG and PDF.
+# One PMF figure and one count figure per layer, saved as PNG.
 
 # %%
 all_arrays = [a for arrs in by_dataset.values() for a in arrs]
@@ -485,8 +604,8 @@ else:
     num_layers = max(a.shape[1] for a in all_arrays)
     print(f"Model has {num_layers} MoE layers. Generating figures …")
 
-    out_dir = Path("layer_figures")
-    out_dir.mkdir(exist_ok=True)
+    layer_fig_dir = OUT_DIR / "layer_figures"
+    layer_fig_dir.mkdir(exist_ok=True)
 
     for layer in range(num_layers):
         # ── PMF: line figure ──────────────────────────────────────────────
@@ -514,8 +633,7 @@ else:
         ax_pmf.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
         ax_pmf.grid(True, linestyle="--", alpha=0.4)
         fig_pmf.tight_layout()
-        fig_pmf.savefig(out_dir / f"pmf_layer{layer:02d}.png", dpi=150)
-        fig_pmf.savefig(out_dir / f"pmf_layer{layer:02d}.pdf")
+        fig_pmf.savefig(layer_fig_dir / f"pmf_layer{layer:02d}.png", dpi=150)
         plt.close(fig_pmf)
 
         # ── Absolute count: scatter figure ────────────────────────────────
@@ -543,17 +661,15 @@ else:
         ax_cnt.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
         ax_cnt.grid(True, linestyle="--", alpha=0.4)
         fig_cnt.tight_layout()
-        fig_cnt.savefig(out_dir / f"count_layer{layer:02d}.png", dpi=150)
-        fig_cnt.savefig(out_dir / f"count_layer{layer:02d}.pdf")
+        fig_cnt.savefig(layer_fig_dir / f"count_layer{layer:02d}.png", dpi=150)
         plt.close(fig_cnt)
 
-    print(f"Saved {num_layers * 2} figures (PMF + count per layer) to '{out_dir}/'")
+    print(f"Saved {num_layers * 2} figures (PMF + count per layer) to '{layer_fig_dir}/'")
     print(f"  pmf_layer00.png … pmf_layer{num_layers-1:02d}.png")
     print(f"  count_layer00.png … count_layer{num_layers-1:02d}.png")
 
 # %% [markdown]
-# ## Bonus: interactive layer sweep
-# Run the cell below to save one CDF figure per layer.
+# ## Bonus: per-layer CDF sweep
 
 # %%
 all_arrays = [a for arrs in by_dataset.values() for a in arrs]
@@ -561,8 +677,8 @@ if all_arrays:
     num_layers = max(a.shape[1] for a in all_arrays)
     print(f"Model has {num_layers} MoE layers captured.")
 
-    out_dir = Path("layer_cdfs")
-    out_dir.mkdir(exist_ok=True)
+    layer_cdf_dir = OUT_DIR / "layer_cdfs"
+    layer_cdf_dir.mkdir(exist_ok=True)
 
     for layer in range(num_layers):
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -582,91 +698,188 @@ if all_arrays:
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
         ax.grid(True, linestyle="--", alpha=0.4)
         fig.tight_layout()
-        fig.savefig(out_dir / f"cdf_layer{layer:02d}.png", dpi=150)
-        fig.savefig(out_dir / f"cdf_layer{layer:02d}.pdf")
+        fig.savefig(layer_cdf_dir / f"cdf_layer{layer:02d}.png", dpi=150)
         plt.close(fig)
 
-    print(f"Saved {num_layers} figures to {out_dir}/")
+    print(f"Saved {num_layers} figures to {layer_cdf_dir}/")
 else:
     print("No data loaded – run 02_run_inference.py first.")
 
 # %% [markdown]
-# ## Combined PDF report
+# ## 5. Expert Continuity Analysis
+#
+# For every token in every sample, track which experts are selected at
+# consecutive MoE layers.  A **run of length r** means an expert was
+# continuously selected for **r consecutive layers** for a single token.
+#
+# We compute the PMF of run lengths per dataset and for all datasets
+# combined, revealing whether experts tend to "stick" across layers or
+# are reshuffled at each layer.
 
 # %%
-from matplotlib.backends.backend_pdf import PdfPages
+def compute_continuity_runs(arrays: list[np.ndarray],
+                            n_experts: int) -> np.ndarray:
+    """
+    Count consecutive-layer run lengths for every expert at every token.
 
-COMBINED_PDF = "expert_selection_report.pdf"
+    For each token, an expert's "run" starts when it first appears in a
+    layer's top-k selection and ends when it is absent.  The length of
+    that run (number of consecutive layers) is tallied.
+
+    Args:
+        arrays:    list of [total_tokens, num_layers, topk] int32 arrays
+        n_experts: number of routed experts (used for the presence matrix)
+
+    Returns:
+        1-D int64 array where counts[r] = number of runs of length r.
+        counts[0] is always 0.
+    """
+    all_runs: list[np.ndarray] = []
+
+    for arr in arrays:
+        T, L, K = arr.shape
+        # Process tokens in chunks to limit memory
+        # Each chunk builds a [ct, L, n_experts] bool presence matrix
+        chunk_size = max(1, min(500, 50_000_000 // (L * n_experts)))
+
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk = arr[start:end]          # [ct, L, K]
+            ct = chunk.shape[0]
+
+            # Build presence matrix: presence[t, l, e] = 1 iff expert e
+            # is in the top-k at token t, layer l.
+            presence = np.zeros((ct, L, n_experts), dtype=np.int8)
+            t_idx = np.arange(ct)[:, None]  # [ct, 1]
+            l_idx = np.arange(L)[None, :]   # [1, L]
+            for k in range(K):
+                presence[t_idx, l_idx, chunk[:, :, k]] = 1
+
+            # Reshape to [ct * n_experts, L] — one row per (token, expert)
+            flat = presence.transpose(0, 2, 1).reshape(-1, L)
+
+            # Pad with 0 on both sides so every run of 1s has a
+            # clear start (+1 in diff) and end (-1 in diff).
+            padded = np.pad(flat, ((0, 0), (1, 1)), constant_values=0)
+            d = np.diff(padded, axis=1)     # shape [ct * n_experts, L+1]
+
+            starts_c = np.where(d == 1)[1]
+            ends_c = np.where(d == -1)[1]
+            runs = ends_c - starts_c        # run lengths
+            if len(runs) > 0:
+                all_runs.append(runs)
+
+    if not all_runs:
+        return np.array([0], dtype=np.int64)
+    all_runs_arr = np.concatenate(all_runs)
+    if len(all_runs_arr) == 0:
+        return np.array([0], dtype=np.int64)
+    max_run = int(all_runs_arr.max())
+    counts = np.zeros(max_run + 1, dtype=np.int64)
+    np.add.at(counts, all_runs_arr, 1)
+    return counts
 
 
-def _make_cdf_ax(ax, dataset_dict, counts_fn, title):
-    for dataset_name, arrays in dataset_dict.items():
-        counts = counts_fn(arrays)
-        expert_ids, cdf = counts_to_cdf(counts)
-        if len(expert_ids) == 0:
+# %%
+# ── Determine n_experts for the continuity analysis ──────────────────────────
+all_arrays = [a for arrs in by_dataset.values() for a in arrs]
+
+if not all_arrays:
+    print("No data loaded – skipping continuity analysis.")
+else:
+    n_experts_cont = model_meta["n_routed_experts"]
+    if n_experts_cont is None:
+        n_experts_cont = max(a.max() for a in all_arrays) + 1
+        print(f"(n_routed_experts not in log — inferred {n_experts_cont} from data)")
+
+    print(f"Computing expert continuity runs (n_experts={n_experts_cont}) …")
+
+    # Per-dataset run-length counts
+    dataset_run_counts: dict[str, np.ndarray] = {}
+    for name, arrays in by_dataset.items():
+        rc = compute_continuity_runs(arrays, n_experts_cont)
+        dataset_run_counts[name] = rc
+        total_runs = rc.sum()
+        max_run = len(rc) - 1
+        mean_run = (np.arange(len(rc)) * rc).sum() / total_runs if total_runs > 0 else 0
+        print(f"  {name:20s}: {total_runs:10,} runs, "
+              f"max_run_length={max_run}, mean={mean_run:.2f}")
+
+    # Combined across all datasets
+    max_len = max(len(rc) for rc in dataset_run_counts.values())
+    combined_counts = np.zeros(max_len, dtype=np.int64)
+    for rc in dataset_run_counts.values():
+        combined_counts[:len(rc)] += rc
+    total_combined = combined_counts.sum()
+    mean_combined = (
+        (np.arange(len(combined_counts)) * combined_counts).sum() / total_combined
+        if total_combined > 0 else 0
+    )
+    print(f"  {'ALL':20s}: {total_combined:10,} runs, "
+          f"max_run_length={len(combined_counts)-1}, mean={mean_combined:.2f}")
+    print()
+
+    # ── PMF of run lengths ───────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for name, rc in dataset_run_counts.items():
+        if rc.sum() == 0:
             continue
-        ax.plot(expert_ids, cdf, label=dataset_name, linewidth=1.5)
-    ax.set_xlabel("Expert ID", fontsize=12)
-    ax.set_ylabel("Cumulative selection probability", fontsize=12)
-    ax.set_title(title, fontsize=13)
-    ax.legend(loc="lower right", fontsize=10)
-    ax.set_xlim(left=0); ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-    ax.grid(True, linestyle="--", alpha=0.4)
+        run_ids = np.arange(len(rc))
+        pmf = rc / rc.sum()
+        ax.plot(run_ids[1:], pmf[1:], marker="o", markersize=4,
+                label=name, linewidth=1.3, alpha=0.85)
 
+    # Combined
+    if combined_counts.sum() > 0:
+        run_ids = np.arange(len(combined_counts))
+        pmf = combined_counts / combined_counts.sum()
+        ax.plot(run_ids[1:], pmf[1:], marker="s", markersize=5,
+                label="All datasets", linewidth=2, color="black", alpha=0.9)
 
-def _make_pmf_ax(ax, dataset_dict, counts_fn, title):
-    all_counts = [counts_fn(arrs) for arrs in dataset_dict.values()]
-    n_experts = max((len(c) for c in all_counts if len(c) > 0), default=0)
-    for dataset_name, arrays in dataset_dict.items():
-        counts = counts_fn(arrays)
-        expert_ids, pmf = counts_to_pmf(counts)
-        if len(expert_ids) == 0:
-            continue
-        ax.plot(expert_ids, pmf, label=dataset_name, linewidth=1.2, alpha=0.85)
-    if n_experts > 0:
-        ax.axhline(1 / n_experts, color="black", linestyle=":", linewidth=1, label="Uniform")
-    ax.set_xlabel("Expert ID", fontsize=12)
-    ax.set_ylabel("Selection probability", fontsize=12)
-    ax.set_title(title, fontsize=13)
+    ax.set_xlabel("Consecutive-layer run length", fontsize=12)
+    ax.set_ylabel("Probability", fontsize=12)
+    ax.set_title(f"PMF of Expert Continuity Run Lengths — {MODEL_NAME}", fontsize=13)
     ax.legend(loc="upper right", fontsize=10)
-    ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+    ax.set_xlim(left=1)
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
     ax.grid(True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fig_continuity_pmf.png", dpi=150)
+    plt.show()
 
+    # ── Log-scale version for tail visibility ────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-with PdfPages(COMBINED_PDF) as pdf:
-    # CDF — all layers
-    fig, ax = plt.subplots(figsize=(9, 5))
-    _make_cdf_ax(ax, by_dataset, expert_counts_all_layers,
-                 "Aggregated CDF of Expert Selection (all layers)")
-    fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+    for name, rc in dataset_run_counts.items():
+        if rc.sum() == 0:
+            continue
+        run_ids = np.arange(len(rc))
+        pmf = rc / rc.sum()
+        mask = pmf[1:] > 0
+        ax.plot(run_ids[1:][mask], pmf[1:][mask], marker="o", markersize=4,
+                label=name, linewidth=1.3, alpha=0.85)
 
-    # PMF — all layers
-    fig, ax = plt.subplots(figsize=(9, 5))
-    _make_pmf_ax(ax, by_dataset, expert_counts_all_layers,
-                 "PMF of Expert Selection (all layers)")
-    fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+    if combined_counts.sum() > 0:
+        run_ids = np.arange(len(combined_counts))
+        pmf = combined_counts / combined_counts.sum()
+        mask = pmf[1:] > 0
+        ax.plot(run_ids[1:][mask], pmf[1:][mask], marker="s", markersize=5,
+                label="All datasets", linewidth=2, color="black", alpha=0.9)
 
-    # Per-layer CDF + PMF
-    all_arrays = [a for arrs in by_dataset.values() for a in arrs]
-    if all_arrays:
-        num_layers = max(a.shape[1] for a in all_arrays)
-        for layer in range(num_layers):
-            layer_fn = lambda arrs, l=layer: expert_counts_one_layer(arrs, l)
+    ax.set_xlabel("Consecutive-layer run length", fontsize=12)
+    ax.set_ylabel("Probability (log scale)", fontsize=12)
+    ax.set_title(f"PMF of Expert Continuity Run Lengths (log) — {MODEL_NAME}",
+                 fontsize=13)
+    ax.set_yscale("log")
+    ax.legend(loc="upper right", fontsize=10)
+    ax.set_xlim(left=1)
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    ax.grid(True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fig_continuity_pmf_log.png", dpi=150)
+    plt.show()
 
-            fig, ax = plt.subplots(figsize=(9, 5))
-            _make_cdf_ax(ax, by_dataset, layer_fn,
-                         f"CDF of Expert Selection — Layer {layer}")
-            fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
-
-            fig, ax = plt.subplots(figsize=(9, 5))
-            _make_pmf_ax(ax, by_dataset, layer_fn,
-                         f"PMF of Expert Selection — Layer {layer}")
-            fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
-
-    meta = pdf.infodict()
-    meta["Title"] = "Expert Selection Distribution Report"
-    meta["Subject"] = "MoE expert routing CDF and PMF by dataset and layer"
-
-print(f"Combined PDF saved to: {COMBINED_PDF}")
+    print(f"Continuity figures saved to {OUT_DIR}/")
