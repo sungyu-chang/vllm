@@ -29,9 +29,105 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # ── Configuration ────────────────────────────────────────────────────────────
-LOG_FILE = "expert_log.jsonl"   # produced by 02_run_inference.py
+LOG_FILE = "expert_log_deepseek.jsonl"   # produced by 02_run_inference.py
 LAYER_ID = 0                    # change to inspect a different layer (3-2)
 # ─────────────────────────────────────────────────────────────────────────────
+import matplotlib
+import matplotlib.pyplot as plt
+from cycler import cycler
+import pathlib, textwrap
+
+# ── Inline style (academic.mplstyle) ────────────────────────────────────────
+_STYLE = textwrap.dedent("""
+    pdf.fonttype : 42
+    ps.fonttype  : 42
+
+    font.family      : sans-serif
+    font.sans-serif  : Arial, DejaVu Sans, Helvetica, Liberation Sans
+    font.weight      : bold
+    font.size        : 16
+    axes.titlesize   : 16
+    axes.labelsize   : 16
+    xtick.labelsize  : 16
+    ytick.labelsize  : 16
+    legend.fontsize  : 14
+
+    axes.prop_cycle : cycler('color', ['A6CEE3', '1F78B4', 'B2DF8A', '33A02C', 'FB9A99', 'E31A1C', 'FDBF6F', 'FF7F00', 'CAB2D6', '6A3D9A', 'FFFF99', 'B15928'])
+
+    lines.linewidth  : 1.5
+    lines.markersize : 12
+
+    axes.linewidth   : 1.5
+    axes.edgecolor   : black
+    axes.axisbelow   : True
+
+    xtick.major.width : 1.5
+    xtick.major.size  : 3
+    ytick.major.width : 1.5
+    ytick.major.size  : 3
+    xtick.minor.width : 1.0
+    xtick.minor.size  : 2
+    ytick.minor.width : 1.0
+    ytick.minor.size  : 2
+    xtick.direction   : out
+    ytick.direction   : out
+
+    axes.grid       : True
+    grid.linestyle  : --
+    grid.linewidth  : 1.0
+    grid.alpha      : 0.6
+    axes.grid.axis  : y
+
+    legend.frameon       : False
+    legend.handlelength  : 1.5
+    legend.handletextpad : 0.4
+    legend.columnspacing : 1.0
+
+    hatch.linewidth : 0.5
+
+    savefig.dpi         : 300
+    savefig.bbox        : tight
+    savefig.pad_inches  : 0.01
+""")
+
+# Install into matplotlib's stylelib for this session
+_stylelib = pathlib.Path(matplotlib.get_configdir()) / "stylelib"
+_stylelib.mkdir(parents=True, exist_ok=True)
+(_stylelib / "academic.mplstyle").write_text(_STYLE)
+matplotlib.style.core.reload_library()  # make "academic" discoverable
+
+plt.style.use("academic")
+
+from matplotlib import font_manager
+fp_path = font_manager.findfont(font_manager.FontProperties(family="Arial"))
+fp      = font_manager.FontProperties(fname=fp_path, weight="bold", size=16)
+
+# ── RColorBrewer "Paired" ── C0-C11 ─────────────────────────────────────────
+# Code  Name       Hex
+# C0    BLUE_LT    #A6CEE3
+# C1    BLUE_DK    #1F78B4
+# C2    GREEN_LT   #B2DF8A
+# C3    GREEN_DK   #33A02C
+# C4    RED_LT     #FB9A99
+# C5    RED_DK     #E31A1C
+# C6    ORANGE_LT  #FDBF6F
+# C7    ORANGE_DK  #FF7F00
+# C8    PURPLE_LT  #CAB2D6
+# C9    PURPLE_DK  #6A3D9A
+# C10   YELLOW_LT  #FFFF99
+# C11   BROWN_DK   #B15928
+BLUE_LT   = "#A6CEE3"; BLUE_DK   = "#1F78B4"
+GREEN_LT  = "#B2DF8A"; GREEN_DK  = "#33A02C"
+RED_LT    = "#FB9A99"; RED_DK    = "#E31A1C"
+ORANGE_LT = "#FDBF6F"; ORANGE_DK = "#FF7F00"
+PURPLE_LT = "#CAB2D6"; PURPLE_DK = "#6A3D9A"
+YELLOW_LT = "#FFFF99"; BROWN_DK  = "#B15928"
+PAIRED    = [BLUE_LT, BLUE_DK, GREEN_LT, GREEN_DK, RED_LT, RED_DK,
+             ORANGE_LT, ORANGE_DK, PURPLE_LT, PURPLE_DK, YELLOW_LT, BROWN_DK]
+
+MARKERS    = ["s", "D", "^", "d", "o", "v", "P", "X"]
+LINESTYLES = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
+
 
 # %% [markdown]
 # ## 1. Load and decode the log file
