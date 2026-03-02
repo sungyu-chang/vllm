@@ -36,7 +36,7 @@ from cycler import cycler
 import pathlib, textwrap
 
 # ── Configuration ────────────────────────────────────────────────────────────
-MODEL_NAME = "default_model"      # ← set your model name here
+MODEL_NAME = "deepseek"      # ← set your model name here
 # Override from command line:  python 03_analysis.py <model_name>
 if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
     MODEL_NAME = sys.argv[1]
@@ -48,68 +48,83 @@ OUT_DIR = Path(f"figures_{MODEL_NAME}")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Inline style (academic.mplstyle) ────────────────────────────────────────
-_STYLE = textwrap.dedent("""
-    pdf.fonttype : 42
-    ps.fonttype  : 42
 
-    font.family      : sans-serif
-    font.sans-serif  : Arial, DejaVu Sans, Helvetica, Liberation Sans
-    font.weight      : bold
-    font.size        : 16
-    axes.titlesize   : 16
-    axes.labelsize   : 16
-    xtick.labelsize  : 16
-    ytick.labelsize  : 16
-    legend.fontsize  : 14
+"""Academic matplotlib style setup.
 
-    axes.prop_cycle : cycler('color', ['A6CEE3', '1F78B4', 'B2DF8A', '33A02C', 'FB9A99', 'E31A1C', 'FDBF6F', 'FF7F00', 'CAB2D6', '6A3D9A', 'FFFF99', 'B15928'])
+Import this module or paste its contents into a script / notebook to get:
 
-    lines.linewidth  : 1.5
-    lines.markersize : 12
+- Journal-ready rcParams (Arial Bold, RColorBrewer "Paired" palette, …)
+- ``fp`` — a ``FontProperties`` object (Arial Bold 16) for explicit use
+- ``PAIRED``, ``MARKERS``, ``LINESTYLES`` — convenience constants
+- ``style_ax(ax)`` / ``style_fig(fig, …)`` — apply ``fp`` to all text and
+  optionally create a top or inside legend in one call
 
-    axes.linewidth   : 1.5
-    axes.edgecolor   : black
-    axes.axisbelow   : True
+Requires: matplotlib, cycler.  For Arial on Ubuntu run ``install-fonts.sh``.
+"""
 
-    xtick.major.width : 1.5
-    xtick.major.size  : 3
-    ytick.major.width : 1.5
-    ytick.major.size  : 3
-    xtick.minor.width : 1.0
-    xtick.minor.size  : 2
-    ytick.minor.width : 1.0
-    ytick.minor.size  : 2
-    xtick.direction   : out
-    ytick.direction   : out
-
-    axes.grid       : True
-    grid.linestyle  : --
-    grid.linewidth  : 1.0
-    grid.alpha      : 0.6
-    axes.grid.axis  : y
-
-    legend.frameon       : False
-    legend.handlelength  : 1.5
-    legend.handletextpad : 0.4
-    legend.columnspacing : 1.0
-
-    hatch.linewidth : 0.5
-
-    savefig.dpi         : 300
-    savefig.bbox        : tight
-    savefig.pad_inches  : 0.01
-""")
-
-# Install into matplotlib's stylelib for this session
-_stylelib = pathlib.Path(matplotlib.get_configdir()) / "stylelib"
-_stylelib.mkdir(parents=True, exist_ok=True)
-(_stylelib / "academic.mplstyle").write_text(_STYLE)
-matplotlib.style.core.reload_library()  # make "academic" discoverable
-
-plt.style.use("academic")
-
+import matplotlib
+import matplotlib.pyplot as plt
+from cycler import cycler
 from matplotlib import font_manager
+
+# ── Academic style (applied via rcParams) ───────────────────────────────────
+_ACADEMIC_RC = {
+    "pdf.fonttype":      42,
+    "ps.fonttype":       42,
+
+    "font.family":       "sans-serif",
+    "font.sans-serif":   ["Arial", "DejaVu Sans", "Helvetica", "Liberation Sans"],
+    "font.weight":       "bold",
+    "font.size":         16,
+    "axes.titlesize":    16,
+    "axes.labelsize":    16,
+    "xtick.labelsize":   16,
+    "ytick.labelsize":   16,
+    "legend.fontsize":   14,
+
+    "axes.prop_cycle":   cycler("color", [
+        "#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C",
+        "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A", "#FFFF99", "#B15928",
+    ]),
+
+    "lines.linewidth":   1.5,
+    "lines.markersize":  12,
+
+    "axes.linewidth":    1.5,
+    "axes.edgecolor":    "black",
+    "axes.axisbelow":    True,
+
+    "xtick.major.width": 1.5,
+    "xtick.major.size":  3,
+    "ytick.major.width": 1.5,
+    "ytick.major.size":  3,
+    "xtick.minor.width": 1.0,
+    "xtick.minor.size":  2,
+    "ytick.minor.width": 1.0,
+    "ytick.minor.size":  2,
+    "xtick.direction":   "out",
+    "ytick.direction":   "out",
+
+    "axes.grid":         True,
+    "grid.linestyle":    "--",
+    "grid.linewidth":    1.0,
+    "grid.alpha":        0.6,
+    "axes.grid.axis":    "y",
+
+    "legend.frameon":       False,
+    "legend.handlelength":  1.5,
+    "legend.handletextpad": 0.4,
+    "legend.columnspacing": 1.0,
+
+    "hatch.linewidth":  0.5,
+
+    "savefig.dpi":        300,
+    "savefig.bbox":       "tight",
+    "savefig.pad_inches": 0.01,
+}
+matplotlib.rcParams.update(_ACADEMIC_RC)
+
+# ── Font (Arial Bold 16) ───────────────────────────────────────────────────
 fp_path = font_manager.findfont(font_manager.FontProperties(family="Arial"))
 fp      = font_manager.FontProperties(fname=fp_path, weight="bold", size=16)
 
@@ -139,6 +154,147 @@ PAIRED    = [BLUE_LT, BLUE_DK, GREEN_LT, GREEN_DK, RED_LT, RED_DK,
 MARKERS    = ["s", "D", "^", "d", "o", "v", "P", "X"]
 LINESTYLES = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
 
+
+def style_ax(ax, _fp=None, enforce=False):
+    """Apply fp (Arial Bold 16) to all text elements on a single Axes.
+
+    Parameters
+    ----------
+    enforce : bool, default False
+        When True, also re-apply all academic rcParams (ticks, grid, spines,
+        line widths, marker sizes) directly onto the axes — useful for
+        overriding styles set by someone else's script.
+
+    Call after all data, labels, and limits are set, just before
+    tight_layout() / savefig().
+    """
+    _fp = _fp or fp
+    rc = _ACADEMIC_RC
+
+    # ── Fonts (always applied) ──
+    ax.xaxis.label.set_fontproperties(_fp)
+    ax.yaxis.label.set_fontproperties(_fp)
+    ax.title.set_fontproperties(_fp)
+    for lab in ax.get_xticklabels() + ax.get_yticklabels():
+        lab.set_fontproperties(_fp)
+    leg = ax.get_legend()
+    if leg is not None:
+        for t in leg.get_texts():
+            t.set_fontproperties(_fp)
+
+    if not enforce:
+        return
+
+    # ── Spines ──
+    for spine in ax.spines.values():
+        spine.set_linewidth(rc["axes.linewidth"])
+        spine.set_edgecolor(rc["axes.edgecolor"])
+
+    # ── Ticks ──
+    ax.tick_params(axis="both", which="major",
+                   direction=rc["xtick.direction"],
+                   width=rc["xtick.major.width"],
+                   length=rc["xtick.major.size"],
+                   labelsize=rc["xtick.labelsize"])
+    ax.tick_params(axis="both", which="minor",
+                   direction=rc["xtick.direction"],
+                   width=rc["xtick.minor.width"],
+                   length=rc["xtick.minor.size"])
+
+    # ── Grid ──
+    ax.set_axisbelow(rc["axes.axisbelow"])
+    grid_axis = rc["axes.grid.axis"]
+    grid_kw = dict(linestyle=rc["grid.linestyle"],
+                   linewidth=rc["grid.linewidth"],
+                   alpha=rc["grid.alpha"])
+    ax.xaxis.grid(grid_axis in ("x", "both"), **grid_kw)
+    ax.yaxis.grid(grid_axis in ("y", "both"), **grid_kw)
+
+    # ── Lines & markers on existing artists ──
+    for line in ax.get_lines():
+        line.set_linewidth(rc["lines.linewidth"])
+        line.set_markersize(rc["lines.markersize"])
+
+
+def style_fig(fig, _fp=None, legend_ncol=None, legend_level="fig",
+              legend_loc="top", enforce=False, **legend_kw):
+    """Apply fp to every Axes in fig and optionally create a legend.
+
+    Parameters
+    ----------
+    legend_ncol : int, optional
+        Number of legend columns.  When set, existing legends are replaced.
+        Extra keyword arguments are forwarded to the legend call.
+    legend_level : {"fig", "ax"}, default "fig"
+        ``"fig"`` — one shared legend (handles collected from all axes,
+        first occurrence per label wins).
+        ``"ax"``  — one legend per axes that has labelled handles.
+    legend_loc : str, default "top"
+        ``"top"`` — place the legend outside, centred above the plot area.
+        Any other matplotlib *loc* string (e.g. ``"best"``, ``"upper right"``)
+        places the legend **inside** the axes / figure.
+    enforce : bool, default False
+        When True, also re-apply tick, grid, spine, and line-width settings
+        onto every axes — useful for overriding someone else's script.
+
+    Examples::
+
+        style_fig(fig)                                          # font only
+        style_fig(fig, legend_ncol=4)                           # shared, top
+        style_fig(fig, legend_ncol=4, legend_loc="best")        # shared, auto inside
+        style_fig(fig, legend_ncol=2, legend_level="ax")        # per-axes, top
+        style_fig(fig, legend_ncol=2, legend_level="ax",
+                  legend_loc="upper right")                     # per-axes, inside
+        style_fig(fig, enforce=True)                            # override foreign style
+    """
+    _fp = _fp or fp
+    if enforce:
+        matplotlib.rcParams.update(_ACADEMIC_RC)
+    for ax in fig.get_axes():
+        style_ax(ax, _fp, enforce=enforce)
+
+    if legend_ncol is None:
+        for leg in fig.legends:
+            for t in leg.get_texts():
+                t.set_fontproperties(_fp)
+        return
+
+    if legend_level == "fig":
+        # Collect handles/labels from all axes, first occurrence per label wins
+        seen: dict = {}
+        for ax in fig.get_axes():
+            for h, l in zip(*ax.get_legend_handles_labels()):
+                if l not in seen:
+                    seen[l] = h
+        # Remove per-axes legends
+        for ax in fig.get_axes():
+            if ax.get_legend() is not None:
+                ax.get_legend().remove()
+        if seen:
+            if legend_loc == "top":
+                kw = dict(ncol=legend_ncol, frameon=False, prop=_fp,
+                          loc="upper center", bbox_to_anchor=(0.5, 1.0))
+            else:
+                kw = dict(ncol=legend_ncol, frameon=False, prop=_fp,
+                          loc=legend_loc)
+            kw.update(legend_kw)
+            fig.legend(list(seen.values()), list(seen.keys()), **kw)
+
+    elif legend_level == "ax":
+        for ax in fig.get_axes():
+            handles, labels = ax.get_legend_handles_labels()
+            if not handles:
+                continue
+            if ax.get_legend() is not None:
+                ax.get_legend().remove()
+            if legend_loc == "top":
+                kw = dict(ncol=legend_ncol, frameon=False, prop=_fp,
+                          loc="lower center", bbox_to_anchor=(0.5, 1.0))
+            else:
+                kw = dict(ncol=legend_ncol, frameon=False, prop=_fp,
+                          loc=legend_loc)
+            kw.update(legend_kw)
+            ax.legend(handles, labels, **kw)
 
 print(f"Model:      {MODEL_NAME}")
 print(f"Log file:   {LOG_FILE}")
@@ -440,31 +596,6 @@ fig.tight_layout()
 plt.savefig(OUT_DIR / "fig_cdf_all_layers.png", dpi=150)
 plt.show()
 
-# %% [markdown]
-# ## 3-2. CDF of expert choice at a specific layer (change `LAYER_ID` at the top)
-
-# %%
-fig, ax = plt.subplots(figsize=(9, 5))
-
-for dataset_name, arrays in by_dataset.items():
-    counts = expert_counts_one_layer(arrays, LAYER_ID)
-    expert_ids, cdf = counts_to_cdf(counts)
-    if len(expert_ids) == 0:
-        continue
-    ax.plot(expert_ids, cdf, label=dataset_name, linewidth=1.5)
-
-ax.set_xlabel("Expert ID (routed experts only)", fontsize=12)
-ax.set_ylabel("Cumulative selection probability", fontsize=12)
-ax.set_title(f"Aggregated CDF of Expert Selection at Layer {LAYER_ID}", fontsize=13)
-ax.legend(loc="lower right", fontsize=10)
-ax.set_xlim(left=0)
-ax.set_ylim(0, 1)
-ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-ax.grid(True, linestyle="--", alpha=0.4)
-add_shared_expert_footnote(fig, N_SHARED)
-fig.tight_layout()
-plt.savefig(OUT_DIR / f"fig_cdf_layer{LAYER_ID}.png", dpi=150)
-plt.show()
 
 # %% [markdown]
 # ## 4-1. Probability distribution (PMF) of expert selection — all layers
@@ -498,38 +629,6 @@ fig.tight_layout()
 plt.savefig(OUT_DIR / "fig_pmf_all_layers.png", dpi=150)
 plt.show()
 
-# %% [markdown]
-# ## 4-2. PMF of expert selection at a specific layer (change `LAYER_ID` at the top)
-
-# %%
-fig, ax = plt.subplots(figsize=(9, 5))
-
-for dataset_name, arrays in by_dataset.items():
-    counts = expert_counts_one_layer(arrays, LAYER_ID)
-    expert_ids, pmf = counts_to_pmf(counts)
-    if len(expert_ids) == 0:
-        continue
-    ax.plot(expert_ids, pmf, label=dataset_name, linewidth=1.2, alpha=0.85)
-
-if by_dataset:
-    n_experts = max(
-        len(expert_counts_one_layer(arrs, LAYER_ID)) for arrs in by_dataset.values()
-    )
-    if n_experts > 0:
-        ax.axhline(1 / n_experts, color="black", linestyle=":", linewidth=1, label="Uniform (routed)")
-
-ax.set_xlabel("Expert ID (routed experts only)", fontsize=12)
-ax.set_ylabel("Selection probability", fontsize=12)
-ax.set_title(f"PMF of Expert Selection at Layer {LAYER_ID}", fontsize=13)
-ax.legend(loc="upper right", fontsize=10)
-ax.set_xlim(left=0)
-ax.set_ylim(bottom=0)
-ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-ax.grid(True, linestyle="--", alpha=0.4)
-add_shared_expert_footnote(fig, N_SHARED)
-fig.tight_layout()
-plt.savefig(OUT_DIR / f"fig_pmf_layer{LAYER_ID}.png", dpi=150)
-plt.show()
 
 # %% [markdown]
 # ## 4-3. PMF (line) and absolute invocation count (scatter) — all layers
@@ -668,42 +767,6 @@ else:
     print(f"  pmf_layer00.png … pmf_layer{num_layers-1:02d}.png")
     print(f"  count_layer00.png … count_layer{num_layers-1:02d}.png")
 
-# %% [markdown]
-# ## Bonus: per-layer CDF sweep
-
-# %%
-all_arrays = [a for arrs in by_dataset.values() for a in arrs]
-if all_arrays:
-    num_layers = max(a.shape[1] for a in all_arrays)
-    print(f"Model has {num_layers} MoE layers captured.")
-
-    layer_cdf_dir = OUT_DIR / "layer_cdfs"
-    layer_cdf_dir.mkdir(exist_ok=True)
-
-    for layer in range(num_layers):
-        fig, ax = plt.subplots(figsize=(9, 5))
-        for dataset_name, arrays in by_dataset.items():
-            counts = expert_counts_one_layer(arrays, layer)
-            expert_ids, cdf = counts_to_cdf(counts)
-            if len(expert_ids) == 0:
-                continue
-            ax.plot(expert_ids, cdf, label=dataset_name, linewidth=1.5)
-
-        ax.set_xlabel("Expert ID", fontsize=12)
-        ax.set_ylabel("Cumulative selection probability", fontsize=12)
-        ax.set_title(f"CDF of Expert Selection — Layer {layer}", fontsize=13)
-        ax.legend(loc="lower right", fontsize=10)
-        ax.set_xlim(left=0)
-        ax.set_ylim(0, 1)
-        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-        ax.grid(True, linestyle="--", alpha=0.4)
-        fig.tight_layout()
-        fig.savefig(layer_cdf_dir / f"cdf_layer{layer:02d}.png", dpi=150)
-        plt.close(fig)
-
-    print(f"Saved {num_layers} figures to {layer_cdf_dir}/")
-else:
-    print("No data loaded – run 02_run_inference.py first.")
 
 # %% [markdown]
 # ## 5. Expert Continuity Analysis
