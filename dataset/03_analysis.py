@@ -432,29 +432,43 @@ def pad_to_same_length(*arrays: np.ndarray) -> list[np.ndarray]:
 
 
 def compute_continuity_runs(arrays: list[np.ndarray], n_experts: int) -> np.ndarray:
-    """Count consecutive-layer run lengths for every expert at every token."""
+    """Count consecutive-layer run lengths aggregated over whole prompts.
+
+    For each sample (prompt + output tokens), an expert is considered
+    'present' at a layer if it was selected by ANY token in that sample
+    at that layer.  A run of length r means the expert stayed present for
+    r consecutive layers across the entire prompt.
+
+    Args:
+        arrays:    list of [total_tokens, num_layers, topk] int32 arrays
+        n_experts: number of routed experts
+
+    Returns:
+        1-D int64 array where counts[r] = number of runs of length r.
+        counts[0] is always 0.
+    """
     all_runs: list[np.ndarray] = []
+    l_idx = None  # initialised on first array
 
     for arr in arrays:
         T, L, K = arr.shape
-        chunk_size = max(1, min(500, 50_000_000 // (L * n_experts)))
+        if l_idx is None or l_idx.shape[1] != L:
+            l_idx = np.arange(L)[None, :]   # [1, L] — broadcasts with arr[:, :, k] [T, L]
 
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            chunk = arr[start:end]; ct = chunk.shape[0]
-            presence = np.zeros((ct, L, n_experts), dtype=np.int8)
-            t_idx = np.arange(ct)[:, None]
-            l_idx = np.arange(L)[None, :]
-            for k in range(K):
-                presence[t_idx, l_idx, chunk[:, :, k]] = 1
-            flat   = presence.transpose(0, 2, 1).reshape(-1, L)
-            padded = np.pad(flat, ((0, 0), (1, 1)), constant_values=0)
-            d      = np.diff(padded, axis=1)
-            starts_c = np.where(d == 1)[1]
-            ends_c   = np.where(d == -1)[1]
-            runs = ends_c - starts_c
-            if len(runs) > 0:
-                all_runs.append(runs)
+        # present[l, e] = 1 iff expert e was selected by ANY token at layer l
+        present = np.zeros((L, n_experts), dtype=np.int8)
+        for k in range(K):
+            present[l_idx, arr[:, :, k]] = 1   # arr[:, :, k] is [T, L]
+
+        # One row per expert: sequence of 0/1 over layers
+        flat   = present.T                                          # [n_experts, L]
+        padded = np.pad(flat, ((0, 0), (1, 1)), constant_values=0)
+        d      = np.diff(padded, axis=1)
+        starts_c = np.where(d == 1)[1]
+        ends_c   = np.where(d == -1)[1]
+        runs = ends_c - starts_c
+        if len(runs) > 0:
+            all_runs.append(runs)
 
     if not all_runs:
         return np.array([0], dtype=np.int64)
