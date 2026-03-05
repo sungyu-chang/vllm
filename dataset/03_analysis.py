@@ -971,7 +971,7 @@ else:
         ax_pmf.set_xlim(left=0)
         ax_pmf.set_ylim(bottom=0)
         ax_pmf.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-        style_fig(fig_pmf)
+        style_fig(fig_pmf, legend_ncol=3)
         fig_pmf.savefig(layer_fig_dir / f"pmf_layer{layer:02d}.png", dpi=150)
         plt.close(fig_pmf)
 
@@ -997,7 +997,7 @@ else:
         ax_cnt.set_xlim(left=0)
         ax_cnt.set_ylim(bottom=0)
         ax_cnt.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-        style_fig(fig_cnt)
+        style_fig(fig_cnt, legend_ncol=3)
         fig_cnt.savefig(layer_fig_dir / f"count_layer{layer:02d}.png", dpi=150)
         plt.close(fig_cnt)
 
@@ -1086,7 +1086,7 @@ else:
         run_ids = np.arange(len(combined_counts))
         pmf = combined_counts / combined_counts.sum()
         ax.plot(run_ids[1:], pmf[1:], marker="s", markersize=5,
-                label="All datasets", linewidth=2, color="black", alpha=0.9)
+                label="All datasets", linewidth=2, linestyle=":", color="black", alpha=0.9)
 
     ax.set_xlabel("Consecutive-layer run length")
     ax.set_ylabel("Probability")
@@ -1117,7 +1117,7 @@ else:
         pmf = combined_counts / combined_counts.sum()
         mask = pmf[1:] > 0
         ax.plot(run_ids[1:][mask], pmf[1:][mask], marker="s", markersize=5,
-                label="All datasets", linewidth=2, color="black", alpha=0.9)
+                label="All datasets", linewidth=2, linestyle=":", color="black", alpha=0.9)
 
     ax.set_xlabel("Consecutive-layer run length")
     ax.set_ylabel("Probability (log scale)")
