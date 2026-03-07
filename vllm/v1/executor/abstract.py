@@ -107,13 +107,25 @@ class Executor(ABC):
     def _init_executor(self) -> None:
         raise NotImplementedError
 
-    def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+    def initialize_from_config(
+        self, kv_cache_configs: list[KVCacheConfig]
+    ) -> int:
         """
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
+
+        Returns:
+            The number of bytes consumed by CUDA graph capture across all
+            workers (0 in eager mode). In tensor-parallel setups all workers
+            capture the same graphs, so the value from rank 0 is returned.
         """
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
-        self.collective_rpc("compile_or_warm_up_model")
+        cuda_graph_memory_per_worker: list[int] = self.collective_rpc(
+            "compile_or_warm_up_model"
+        )
+        # All TP workers capture the same CUDA graphs; take the value from
+        # the first worker (rank 0).
+        return cuda_graph_memory_per_worker[0] if cuda_graph_memory_per_worker else 0
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """

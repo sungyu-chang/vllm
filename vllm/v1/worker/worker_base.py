@@ -87,8 +87,13 @@ class WorkerBase:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
 
-    def compile_or_warm_up_model(self) -> None:
-        """Prepare model for execution through compilation/warmup."""
+    def compile_or_warm_up_model(self) -> int:
+        """Prepare model for execution through compilation/warmup.
+
+        Returns:
+            The number of bytes consumed by CUDA graph capture (0 if no
+            CUDA graphs were captured, e.g. eager mode or CPU workers).
+        """
         raise NotImplementedError
 
     def check_health(self) -> None:

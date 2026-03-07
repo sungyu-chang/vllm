@@ -262,11 +262,43 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
 
-        # Initialize kv cache and warmup the execution
-        self.model_executor.initialize_from_config(kv_cache_configs)
+        # Initialize kv cache and warmup the execution.
+        # initialize_from_config() returns the CUDA graph memory (bytes)
+        # consumed during graph capture.  This memory was not known at the
+        # time available_gpu_memory was computed, so we subtract it from the
+        # available budget and recompute num_blocks so that the scheduler
+        # operates with an accurate block count that reflects actual GPU usage.
+        cuda_graph_memory_bytes = self.model_executor.initialize_from_config(
+            kv_cache_configs
+        )
+
+        if cuda_graph_memory_bytes > 0 and has_kv_cache:
+            # Recompute kv_cache_configs with the CUDA graph memory subtracted
+            # from each worker's available budget.  The KV cache tensors are
+            # already allocated (with a slightly larger num_blocks), but the
+            # scheduler will only see and use the adjusted, smaller num_blocks,
+            # which correctly accounts for the CUDA graph overhead.
+            adjusted_available_gpu_memory = [
+                max(m - cuda_graph_memory_bytes, 0)
+                for m in available_gpu_memory
+            ]
+            adjusted_kv_cache_configs = get_kv_cache_configs(
+                vllm_config, kv_cache_specs, adjusted_available_gpu_memory
+            )
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                adjusted_kv_cache_configs
+            )
+            logger.debug(
+                "Adjusted KV cache num_blocks from %d to %d after accounting "
+                "for %.2f GiB of CUDA graph memory.",
+                kv_cache_configs[0].num_blocks,
+                scheduler_kv_cache_config.num_blocks,
+                cuda_graph_memory_bytes / (1 << 30),
+            )
+
+        num_gpu_blocks = scheduler_kv_cache_config.num_blocks
 
         elapsed = time.time() - start
         logger.info_once(
