@@ -290,7 +290,7 @@ class EngineCore:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
                 adjusted_kv_cache_configs
             )
-            logger.debug(
+            logger.info(
                 "Adjusted KV cache num_blocks from %d to %d after accounting "
                 "for %.2f GiB of CUDA graph memory.",
                 kv_cache_configs[0].num_blocks,
