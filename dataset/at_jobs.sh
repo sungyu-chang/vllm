@@ -19,7 +19,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 ARCHIVE="/tmp/expert_logs_${TIMESTAMP}.tar.gz"
 
 echo "Compressing dataset logs..."
-tar -czf "$ARCHIVE" -C /mydata/songyu/vllm dataset/expert_log_*.jsonl
+tar -czf "$ARCHIVE" -C /mydata/songyu/vllm dataset/
 echo "Archive: $ARCHIVE ($(du -sh "$ARCHIVE" | cut -f1))"
 
 echo "Uploading to cloud via rclone..."
