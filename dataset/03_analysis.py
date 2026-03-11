@@ -41,6 +41,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from cycler import cycler
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform
 
 # ── Configuration ────────────────────────────────────────────────────────────
 MODEL_NAME = "deepseek"      # ← set your model name here
@@ -425,6 +427,19 @@ def symmetric_kl(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-12) -> float:
     return (kl_divergence(p, q, epsilon) + kl_divergence(q, p, epsilon)) / 2.0
 
 
+def jsd(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-12) -> float:
+    """Jensen-Shannon Divergence (base-e, bounded [0, ln2]).
+
+    JSD(P, Q) = (KL(P‖M) + KL(Q‖M)) / 2  where M = (P + Q) / 2.
+    Use sqrt(jsd(...)) for a proper metric satisfying the triangle inequality.
+    """
+    p = np.asarray(p, dtype=np.float64) + epsilon
+    q = np.asarray(q, dtype=np.float64) + epsilon
+    p = p / p.sum(); q = q / q.sum()
+    m = 0.5 * (p + q)
+    return float(0.5 * np.sum(p * np.log(p / m)) + 0.5 * np.sum(q * np.log(q / m)))
+
+
 def pad_to_same_length(*arrays: np.ndarray) -> list[np.ndarray]:
     max_len = max(len(a) for a in arrays)
     return [np.pad(a, (0, max_len - len(a))) if len(a) < max_len else a
@@ -495,6 +510,7 @@ expert_counts_per_layer: dict[str, list]       = {}  # name → list[np.ndarray]
 kl_overall_rows:  list[tuple] = []   # (ds_a, ds_b, skl, flag_str)
 kl_matrix:        np.ndarray | None = None  # [n_pairs, n_layers]
 kl_pairs:         list[tuple] = []          # [(ds_a, ds_b), …]
+jsd_dist_matrix:  np.ndarray | None = None  # [n_datasets, n_datasets] symmetric, sqrt(JSD)
 dataset_run_counts: dict[str, np.ndarray] = {}
 combined_counts:    np.ndarray | None = None
 dataset_names: list[str] = []
@@ -547,7 +563,15 @@ def _save_analysis() -> None:
                 for layer in range(kl_matrix.shape[1]):
                     w.writerow([ds_a, ds_b, layer, float(kl_matrix[i, layer])])
 
-    # 5. continuity_runs.csv
+    # 5. jsd_dist_matrix.csv  (N×N √JSD distances)
+    if jsd_dist_matrix is not None:
+        with open(DATA_DIR / "jsd_dist_matrix.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["dataset"] + dataset_names)
+            for i, name in enumerate(dataset_names):
+                w.writerow([name] + [float(jsd_dist_matrix[i, j]) for j in range(len(dataset_names))])
+
+    # 6. continuity_runs.csv
     max_r = max((len(rc) for rc in dataset_run_counts.values()), default=0)
     if combined_counts is not None:
         max_r = max(max_r, len(combined_counts))
@@ -578,7 +602,7 @@ def _save_analysis() -> None:
 def _load_analysis() -> None:
     """Load all analysis results from DATA_DIR into the global data structures."""
     global expert_counts_all, expert_counts_per_layer, kl_overall_rows
-    global kl_matrix, kl_pairs, dataset_run_counts, combined_counts
+    global kl_matrix, kl_pairs, jsd_dist_matrix, dataset_run_counts, combined_counts
     global dataset_names, n_experts, N_SHARED, num_layers
 
     with open(DATA_DIR / "model_meta.json") as f:
@@ -643,6 +667,17 @@ def _load_analysis() -> None:
             for pi, li, skl in rows_raw:
                 kl_matrix[pi, li] = skl
 
+    # jsd_dist_matrix.csv
+    jsd_path = DATA_DIR / "jsd_dist_matrix.csv"
+    if jsd_path.exists():
+        with open(jsd_path, newline="") as f:
+            r = csv.reader(f)
+            header = next(r)
+            col_names_jsd = header[1:]
+            rows_jsd = [list(map(float, row[1:])) for row in r]
+        if rows_jsd:
+            jsd_dist_matrix = np.array(rows_jsd)
+
     # continuity_runs.csv
     rc_cols: dict[str, list] = defaultdict(list)
     combined_list: list[int] = []
@@ -691,10 +726,10 @@ else:
             for layer in range(num_layers)
         ]
 
-    # ── KL divergence ────────────────────────────────────────────────────
+    # ── KL divergence + JSD ──────────────────────────────────────────────
     kl_pairs = list(combinations(dataset_names, 2))
     if kl_pairs:
-        print("Computing KL divergences …")
+        print("Computing KL divergences and JSD …")
         pmfs_overall = {}
         for name in dataset_names:
             _, pmf = counts_to_pmf(expert_counts_all[name])
@@ -716,6 +751,17 @@ else:
                 if len(pa) > 0 and len(pb) > 0:
                     pa, pb = pad_to_same_length(pa, pb)
                     kl_matrix[i, layer] = symmetric_kl(pa, pb)
+
+        # Build N×N √JSD distance matrix (proper metric)
+        n_ds = len(dataset_names)
+        jsd_dist_matrix = np.zeros((n_ds, n_ds))
+        for i, ds_a in enumerate(dataset_names):
+            for j, ds_b in enumerate(dataset_names):
+                if i < j:
+                    pa, pb = pad_to_same_length(pmfs_overall[ds_a], pmfs_overall[ds_b])
+                    d = np.sqrt(jsd(pa, pb))
+                    jsd_dist_matrix[i, j] = d
+                    jsd_dist_matrix[j, i] = d
 
     # ── Expert continuity ─────────────────────────────────────────────────
     if all_arrays:
@@ -1054,7 +1100,58 @@ if kl_matrix is not None and len(kl_pairs) > 0:
     plt.show()
 
 # %% [markdown]
-# ## 6. Expert Continuity Analysis
+# ## 6. JSD Distance Heatmap (dataset × dataset)
+#
+# Square N×N heatmap of √JSD distances between all dataset pairs.
+# √JSD is a proper metric (satisfies triangle inequality), bounded [0, √ln2 ≈ 0.833].
+
+# %%
+if jsd_dist_matrix is not None and len(dataset_names) > 1:
+    n_ds = len(dataset_names)
+    fig, ax = plt.subplots(figsize=(max(5, n_ds * 1.2 + 1), max(4, n_ds * 1.2)))
+    im = ax.imshow(jsd_dist_matrix, cmap="YlOrRd", vmin=0)
+    ax.set_xticks(range(n_ds))
+    ax.set_yticks(range(n_ds))
+    ax.set_xticklabels(dataset_names, rotation=40, ha="right", fontsize=9)
+    ax.set_yticklabels(dataset_names, fontsize=9)
+    ax.set_title(f"Pairwise √JSD Distance — {MODEL_NAME}")
+    fig.colorbar(im, ax=ax, label="√JSD distance")
+    # Annotate cells with values
+    for i in range(n_ds):
+        for j in range(n_ds):
+            ax.text(j, i, f"{jsd_dist_matrix[i, j]:.3f}",
+                    ha="center", va="center", fontsize=8,
+                    color="white" if jsd_dist_matrix[i, j] > jsd_dist_matrix.max() * 0.6 else "black")
+    style_fig(fig)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fig_jsd_heatmap.png", dpi=150)
+    plt.show()
+
+# %% [markdown]
+# ## 7. Hierarchical Clustering of Datasets (√JSD)
+#
+# Agglomerative clustering using √JSD as the distance metric.
+# The dendrogram shows which datasets have the most similar expert routing behaviour.
+
+# %%
+if jsd_dist_matrix is not None and len(dataset_names) > 2:
+    # condensed distance vector required by scipy linkage
+    condensed = squareform(jsd_dist_matrix, checks=False)
+    Z = linkage(condensed, method="average")
+
+    fig, ax = plt.subplots(figsize=(max(7, len(dataset_names) * 1.5), 4))
+    dendrogram(Z, labels=dataset_names, ax=ax, leaf_rotation=30, leaf_font_size=10)
+    ax.set_ylabel("√JSD distance")
+    ax.set_title(f"Hierarchical Clustering of Datasets by Expert Routing — {MODEL_NAME}")
+    style_fig(fig)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "fig_dataset_clustering.png", dpi=150)
+    plt.show()
+elif jsd_dist_matrix is not None and len(dataset_names) == 2:
+    print("Only 2 datasets — dendrogram requires at least 3. Skipping clustering.")
+
+# %% [markdown]
+# ## 8. Expert Continuity Analysis
 #
 # PMF of consecutive-layer run lengths per dataset and combined.
 
