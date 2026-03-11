@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Benchmark Triton fused MoE kernel vs native PyTorch per-expert matmul.
+
+Usage examples:
+    # Preset model, sweep token counts and distributions
+    python expert_measurement/benchmark.py --model mixtral-8x7b \
+        --num-tokens 32 128 512 --distribution uniform zipf --zipf-alpha 0.0 1.0
+
+    # HuggingFace model (downloads config.json only, no weights)
+    python expert_measurement/benchmark.py --hf-model mistralai/Mixtral-8x7B-v0.1 \
+        --num-tokens 512
+
+    # Manual config
+    python expert_measurement/benchmark.py --num-experts 8 --top-k 2 \
+        --hidden-size 4096 --intermediate-size 14336 --num-tokens 128 512
+
+    # Profile mode for nsys/ncu
+    python expert_measurement/benchmark.py --model mixtral-8x7b --num-tokens 512 \
+        --profile --approach triton
+
+    # List available presets
+    python expert_measurement/benchmark.py --list-presets
+"""
+
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from expert_measurement.expert_distribution import (
+    generate_expert_assignments,
+    get_distribution_stats,
+    print_distribution_stats,
+)
+from expert_measurement.model_configs import (
+    MoEModelConfig,
+    get_config,
+    list_presets,
+)
+
+# ---------------------------------------------------------------------------
+# Native PyTorch reference (per-expert sequential matmul)
+# ---------------------------------------------------------------------------
+
+
+def native_moe_forward(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Per-expert torch.matmul loop — the 'native' baseline.
+
+    Mirrors the reference implementation from tests/kernels/utils.py:torch_experts.
+    """
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    M, K = hidden_states.shape
+    top_k = topk_ids.shape[1]
+    num_experts = w1.shape[0]
+
+    a = hidden_states.view(M, 1, K).repeat(1, top_k, 1).reshape(-1, K)
+    out = torch.zeros(M * top_k, w2.shape[1], dtype=a.dtype, device=a.device)
+
+    flat_ids = topk_ids.view(-1)
+    act_fn = SiluAndMul()
+
+    for i in range(num_experts):
+        mask = flat_ids == i
+        if mask.any():
+            tmp1 = a[mask] @ w1[i].transpose(0, 1)
+            tmp2 = act_fn(tmp1)
+            out[mask] = tmp2 @ w2[i].transpose(0, 1)
+
+    return (
+        (out.view(M, top_k, -1).to(torch.float32) * topk_weights.unsqueeze(-1))
+        .sum(dim=1)
+        .to(hidden_states.dtype)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Triton fused MoE (from vLLM)
+# ---------------------------------------------------------------------------
+
+
+def triton_moe_forward(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """vLLM's Triton fused_experts kernel."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+
+    return fused_experts(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        inplace=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Padding waste estimation
+# ---------------------------------------------------------------------------
+
+
+def estimate_padding_waste(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int = 64,
+) -> float:
+    """Estimate fraction of compute wasted on padding rows for Triton kernel."""
+    flat = topk_ids.view(-1).cpu()
+    actual_total = 0
+    padded_total = 0
+    for eid in range(num_experts):
+        count = int((flat == eid).sum().item())
+        if count > 0:
+            actual_total += count
+            padded_total += ((count + block_size - 1) // block_size) * block_size
+    if padded_total == 0:
+        return 0.0
+    return (padded_total - actual_total) / padded_total
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+
+
+def benchmark_single(
+    fn,
+    args: tuple,
+    num_warmup: int,
+    num_iters: int,
+    profile: bool = False,
+    label: str = "",
+) -> list[float]:
+    """Run a function and return per-iteration GPU times in milliseconds."""
+    # Warmup
+    for _ in range(num_warmup):
+        fn(*args)
+    torch.cuda.synchronize()
+
+    if profile:
+        torch.cuda.cudart().cudaProfilerStart()
+
+    times = []
+    for i in range(num_iters):
+        if profile:
+            torch.cuda.nvtx.range_push(f"{label}_iter_{i}")
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(*args)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+
+        if profile:
+            torch.cuda.nvtx.range_pop()
+
+    if profile:
+        torch.cuda.cudart().cudaProfilerStop()
+
+    return times
+
+
+def run_benchmark(
+    cfg: MoEModelConfig,
+    num_tokens: int,
+    distribution: str,
+    zipf_alpha: float,
+    dtype: torch.dtype,
+    approaches: list[str],
+    num_warmup: int,
+    num_iters: int,
+    profile: bool,
+    tp: int,
+    seed: int,
+) -> list[dict]:
+    """Run benchmark for a single configuration, return result rows."""
+    E = cfg.num_experts
+    K = cfg.hidden_size
+    N = cfg.intermediate_size // tp  # Simulate TP sharding
+
+    # Generate data
+    hidden_states = torch.randn(num_tokens, K, dtype=dtype, device="cuda")
+    w1 = torch.randn(E, 2 * N, K, dtype=dtype, device="cuda") * 0.01
+    w2 = torch.randn(E, K, N, dtype=dtype, device="cuda") * 0.01
+
+    topk_ids, topk_weights = generate_expert_assignments(
+        num_tokens=num_tokens,
+        num_experts=E,
+        top_k=cfg.top_k,
+        distribution=distribution,
+        zipf_alpha=zipf_alpha,
+        seed=seed,
+    )
+
+    dist_stats = get_distribution_stats(topk_ids, E)
+    waste = estimate_padding_waste(topk_ids, E)
+
+    dist_label = distribution
+    if distribution == "zipf":
+        dist_label = f"zipf(a={zipf_alpha})"
+
+    print(f"\n{'=' * 70}")
+    print(
+        f"Model: {cfg.model_name} (E={E}, top_k={cfg.top_k}, "
+        f"H={K}, N={N}{f', TP={tp}' if tp > 1 else ''})"
+    )
+    print(f"Dtype: {dtype}, Tokens: {num_tokens}, Distribution: {dist_label}")
+    print_distribution_stats(topk_ids, E)
+    print(f"  Estimated padding waste (block=64): {waste:.1%}")
+    print(f"{'=' * 70}")
+
+    results = []
+    fn_map = {
+        "triton": ("Triton Fused", triton_moe_forward),
+        "native": ("Native PyTorch", native_moe_forward),
+    }
+
+    timings = {}
+    for approach in approaches:
+        label, fn = fn_map[approach]
+
+        if profile:
+            torch.cuda.nvtx.range_push(f"benchmark_{approach}")
+
+        times = benchmark_single(
+            fn=fn,
+            args=(hidden_states, w1, w2, topk_weights, topk_ids),
+            num_warmup=num_warmup,
+            num_iters=num_iters,
+            profile=profile,
+            label=approach,
+        )
+
+        if profile:
+            torch.cuda.nvtx.range_pop()
+
+        times_np = np.array(times)
+        timings[approach] = times_np
+        print(
+            f"  {label:<16}: "
+            f"mean={times_np.mean():.3f}ms, "
+            f"median={np.median(times_np):.3f}ms, "
+            f"min={times_np.min():.3f}ms, "
+            f"max={times_np.max():.3f}ms, "
+            f"std={times_np.std():.3f}ms"
+        )
+
+    # Compute speedup if both approaches were run
+    if "triton" in timings and "native" in timings:
+        speedup = np.median(timings["native"]) / np.median(timings["triton"])
+        print(f"  Speedup (Triton vs Native): {speedup:.2f}x")
+    else:
+        speedup = None
+
+    for approach in approaches:
+        t = timings[approach]
+        results.append({
+            "model": cfg.model_name,
+            "num_experts": E,
+            "top_k": cfg.top_k,
+            "hidden_size": K,
+            "intermediate_size": N,
+            "num_tokens": num_tokens,
+            "distribution": dist_label,
+            "gini": f"{dist_stats['gini']:.3f}",
+            "padding_waste": f"{waste:.3f}",
+            "approach": approach,
+            "mean_ms": f"{t.mean():.3f}",
+            "median_ms": f"{np.median(t):.3f}",
+            "min_ms": f"{t.min():.3f}",
+            "max_ms": f"{t.max():.3f}",
+            "std_ms": f"{t.std():.3f}",
+            "speedup": f"{speedup:.2f}" if speedup else "",
+        })
+
+    # Free memory
+    del hidden_states, w1, w2, topk_ids, topk_weights
+    torch.cuda.empty_cache()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Benchmark Triton fused MoE vs native PyTorch per-expert matmul",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # Model config source
+    g = p.add_argument_group("Model configuration")
+    g.add_argument("--model", type=str, help="Preset model name (see --list-presets)")
+    g.add_argument("--hf-model", type=str, help="HuggingFace model name/path")
+    g.add_argument("--num-experts", type=int, help="Override: number of experts")
+    g.add_argument("--top-k", type=int, help="Override: experts per token")
+    g.add_argument("--hidden-size", type=int, help="Override: hidden dimension")
+    g.add_argument("--intermediate-size", type=int, help="Override: intermediate dim")
+    g.add_argument("--tp", type=int, default=1, help="Simulate tensor parallelism (divides intermediate_size)")
+    g.add_argument("--list-presets", action="store_true", help="List presets and exit")
+
+    # Workload
+    g2 = p.add_argument_group("Workload")
+    g2.add_argument("--num-tokens", type=int, nargs="+", default=[32, 128, 512], help="Token counts to benchmark")
+    g2.add_argument("--distribution", type=str, nargs="+", default=["uniform"], help="Expert distributions: uniform, zipf, single_hot")
+    g2.add_argument("--zipf-alpha", type=float, nargs="+", default=[1.0], help="Zipf exponents (used when distribution=zipf)")
+    g2.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"], help="Compute dtype")
+    g2.add_argument("--seed", type=int, default=42, help="Random seed")
+
+    # Benchmark control
+    g3 = p.add_argument_group("Benchmark control")
+    g3.add_argument("--approach", type=str, nargs="+", default=["triton", "native"], choices=["triton", "native"], help="Which approaches to benchmark")
+    g3.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations")
+    g3.add_argument("--num-iters", type=int, default=100, help="Timed iterations")
+
+    # Profiler support
+    g4 = p.add_argument_group("Profiler (nsys / ncu)")
+    g4.add_argument("--profile", action="store_true", help="Enable profiling mode: adds NVTX markers, uses cudaProfilerApi, reduces iterations")
+    g4.add_argument("--profile-iters", type=int, default=3, help="Number of iterations in profile mode (overrides --num-iters)")
+
+    # Output
+    g5 = p.add_argument_group("Output")
+    g5.add_argument("--csv", type=str, help="Write results to CSV file")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.list_presets:
+        list_presets()
+        sys.exit(0)
+
+    cfg = get_config(
+        model=args.model,
+        hf_model=args.hf_model,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+    )
+
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+
+    num_iters = args.profile_iters if args.profile else args.num_iters
+    num_warmup = 2 if args.profile else args.num_warmup
+
+    if args.profile:
+        print("[Profile mode] NVTX markers enabled, cudaProfilerApi start/stop active")
+        print(f"[Profile mode] Using {num_warmup} warmup + {num_iters} measured iterations")
+        print("Run with: nsys profile --capture-range=cudaProfilerApi -o <output> python ...")
+        print("      or: ncu --set full -o <output> python ... --approach triton --num-tokens <N>")
+
+    all_results = []
+
+    # Build the sweep: (distribution, zipf_alpha) pairs
+    dist_configs = []
+    for dist in args.distribution:
+        if dist == "zipf":
+            for alpha in args.zipf_alpha:
+                dist_configs.append((dist, alpha))
+        else:
+            dist_configs.append((dist, 0.0))
+
+    for num_tokens in args.num_tokens:
+        for dist, alpha in dist_configs:
+            results = run_benchmark(
+                cfg=cfg,
+                num_tokens=num_tokens,
+                distribution=dist,
+                zipf_alpha=alpha,
+                dtype=dtype,
+                approaches=args.approach,
+                num_warmup=num_warmup,
+                num_iters=num_iters,
+                profile=args.profile,
+                tp=args.tp,
+                seed=args.seed,
+            )
+            all_results.extend(results)
+
+    # Write CSV if requested
+    if args.csv and all_results:
+        path = Path(args.csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\nResults written to {path}")
+
+    # Print summary table
+    if len(all_results) > 2:
+        print(f"\n{'=' * 90}")
+        print("SUMMARY")
+        print(f"{'=' * 90}")
+        print(
+            f"{'Tokens':>7} {'Distribution':<16} {'Approach':<10} "
+            f"{'Median(ms)':>10} {'Waste':>7} {'Speedup':>8}"
+        )
+        print("-" * 62)
+        for r in all_results:
+            print(
+                f"{r['num_tokens']:>7} {r['distribution']:<16} {r['approach']:<10} "
+                f"{r['median_ms']:>10} {r['padding_waste']:>7} {r['speedup']:>8}"
+            )
+
+
+if __name__ == "__main__":
+    main()
