@@ -15,6 +15,10 @@ Usage examples:
     python expert_measurement/benchmark.py --num-experts 8 --top-k 2 \
         --hidden-size 4096 --intermediate-size 14336 --num-tokens 128 512
 
+    # Expert parallelism: sweep EP=1,2,4 (simulates hosting fewer experts per GPU)
+    python expert_measurement/benchmark.py --model mixtral-8x7b \
+        --num-tokens 128 512 --ep 1 2 4
+
     # Profile mode for nsys/ncu
     python expert_measurement/benchmark.py --model mixtral-8x7b --num-tokens 512 \
         --profile --approach triton
@@ -116,6 +120,49 @@ def triton_moe_forward(
 
 
 # ---------------------------------------------------------------------------
+# Expert-parallelism helpers
+# ---------------------------------------------------------------------------
+
+
+def filter_for_ep_rank(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    ep: int,
+    ep_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Filter routing to only include experts hosted on *ep_rank*.
+
+    With expert parallelism degree ``ep``, each rank hosts
+    ``num_experts // ep`` contiguous experts.  Tokens routed to non-local
+    experts are dropped (they'd be on another GPU in a real system).
+
+    Returns:
+        topk_ids:   remapped to local expert indices [0, local_E)
+        topk_weights: re-normalised per token
+        local_E:    number of local experts
+    """
+    local_E = num_experts // ep
+    start = ep_rank * local_E
+    end = start + local_E
+
+    # Mask: True where the assignment is to a local expert
+    local_mask = (topk_ids >= start) & (topk_ids < end)  # [M, top_k]
+
+    # Remap expert ids to local range
+    local_ids = topk_ids - start  # shift to [0, local_E)
+    # Set non-local slots to -1 (they won't match any expert in the loop)
+    local_ids = torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
+
+    # Zero out non-local weights and re-normalise
+    local_weights = topk_weights * local_mask.float()
+    row_sums = local_weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    local_weights = local_weights / row_sums
+
+    return local_ids, local_weights, local_E
+
+
+# ---------------------------------------------------------------------------
 # Padding waste estimation
 # ---------------------------------------------------------------------------
 
@@ -194,6 +241,8 @@ def run_benchmark(
     num_iters: int,
     profile: bool,
     tp: int,
+    ep: int,
+    ep_rank: int,
     seed: int,
 ) -> list[dict]:
     """Run benchmark for a single configuration, return result rows."""
@@ -201,11 +250,7 @@ def run_benchmark(
     K = cfg.hidden_size
     N = cfg.intermediate_size // tp  # Simulate TP sharding
 
-    # Generate data
-    hidden_states = torch.randn(num_tokens, K, dtype=dtype, device="cuda")
-    w1 = torch.randn(E, 2 * N, K, dtype=dtype, device="cuda") * 0.01
-    w2 = torch.randn(E, K, N, dtype=dtype, device="cuda") * 0.01
-
+    # Generate routing over *all* experts (full router view)
     topk_ids, topk_weights = generate_expert_assignments(
         num_tokens=num_tokens,
         num_experts=E,
@@ -216,19 +261,34 @@ def run_benchmark(
     )
 
     dist_stats = get_distribution_stats(topk_ids, E)
-    waste = estimate_padding_waste(topk_ids, E)
+
+    # Apply expert parallelism: keep only local experts
+    if ep > 1:
+        topk_ids, topk_weights, E_local = filter_for_ep_rank(
+            topk_ids, topk_weights, E, ep, ep_rank,
+        )
+    else:
+        E_local = E
+
+    waste = estimate_padding_waste(topk_ids, E_local)
+
+    # Generate data — weights are sized for local experts only
+    hidden_states = torch.randn(num_tokens, K, dtype=dtype, device="cuda")
+    w1 = torch.randn(E_local, 2 * N, K, dtype=dtype, device="cuda") * 0.01
+    w2 = torch.randn(E_local, K, N, dtype=dtype, device="cuda") * 0.01
 
     dist_label = distribution
     if distribution == "zipf":
         dist_label = f"zipf(a={zipf_alpha})"
 
+    ep_info = f", EP={ep}, rank={ep_rank}, local_E={E_local}" if ep > 1 else ""
     print(f"\n{'=' * 70}")
     print(
         f"Model: {cfg.model_name} (E={E}, top_k={cfg.top_k}, "
-        f"H={K}, N={N}{f', TP={tp}' if tp > 1 else ''})"
+        f"H={K}, N={N}{f', TP={tp}' if tp > 1 else ''}{ep_info})"
     )
     print(f"Dtype: {dtype}, Tokens: {num_tokens}, Distribution: {dist_label}")
-    print_distribution_stats(topk_ids, E)
+    print_distribution_stats(topk_ids, E_local)
     print(f"  Estimated padding waste (block=64): {waste:.1%}")
     print(f"{'=' * 70}")
 
@@ -276,6 +336,8 @@ def run_benchmark(
         results.append({
             "model": cfg.model_name,
             "num_experts": E,
+            "local_experts": E_local,
+            "ep": ep,
             "top_k": cfg.top_k,
             "hidden_size": K,
             "intermediate_size": N,
@@ -326,6 +388,8 @@ def parse_args():
     g.add_argument("--hidden-size", type=int, help="Override: hidden dimension")
     g.add_argument("--intermediate-size", type=int, help="Override: intermediate dim")
     g.add_argument("--tp", type=int, default=1, help="Simulate tensor parallelism (divides intermediate_size)")
+    g.add_argument("--ep", type=int, nargs="+", default=[1], help="Expert parallelism degrees to sweep (e.g. 1 2 4)")
+    g.add_argument("--ep-rank", type=int, default=0, help="Which EP rank to simulate (default: 0)")
     g.add_argument("--list-presets", action="store_true", help="List presets and exit")
 
     # Workload
@@ -372,6 +436,16 @@ def main():
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
 
+    # Validate EP values
+    for ep_val in args.ep:
+        if cfg.num_experts % ep_val != 0:
+            print(f"Error: --ep {ep_val} does not evenly divide "
+                  f"num_experts={cfg.num_experts}")
+            sys.exit(1)
+        if args.ep_rank >= ep_val:
+            print(f"Error: --ep-rank {args.ep_rank} must be < --ep {ep_val}")
+            sys.exit(1)
+
     num_iters = args.profile_iters if args.profile else args.num_iters
     num_warmup = 2 if args.profile else args.num_warmup
 
@@ -388,22 +462,23 @@ def main():
     # Triton compilation *before* any timed benchmarking.
     # ------------------------------------------------------------------
     print("\n[Warmup] Pre-compiling kernels (Triton JIT) ...")
-    E_w = cfg.num_experts
     K_w = cfg.hidden_size
     N_w = cfg.intermediate_size // args.tp
-    for nt in sorted(set(args.num_tokens)):
-        hs = torch.randn(nt, K_w, dtype=dtype, device="cuda")
-        _w1 = torch.randn(E_w, 2 * N_w, K_w, dtype=dtype, device="cuda") * 0.01
-        _w2 = torch.randn(E_w, K_w, N_w, dtype=dtype, device="cuda") * 0.01
-        _ids, _weights = generate_expert_assignments(
-            num_tokens=nt, num_experts=E_w, top_k=cfg.top_k,
-            distribution="uniform", zipf_alpha=0.0, seed=0,
-        )
-        for approach in args.approach:
-            fn = FN_MAP[approach][1]
-            fn(hs, _w1, _w2, _weights, _ids)
-        torch.cuda.synchronize()
-        del hs, _w1, _w2, _ids, _weights
+    for ep_val in sorted(set(args.ep)):
+        E_local = cfg.num_experts // ep_val
+        for nt in sorted(set(args.num_tokens)):
+            hs = torch.randn(nt, K_w, dtype=dtype, device="cuda")
+            _w1 = torch.randn(E_local, 2 * N_w, K_w, dtype=dtype, device="cuda") * 0.01
+            _w2 = torch.randn(E_local, K_w, N_w, dtype=dtype, device="cuda") * 0.01
+            _ids, _weights = generate_expert_assignments(
+                num_tokens=nt, num_experts=E_local, top_k=cfg.top_k,
+                distribution="uniform", zipf_alpha=0.0, seed=0,
+            )
+            for approach in args.approach:
+                fn = FN_MAP[approach][1]
+                fn(hs, _w1, _w2, _weights, _ids)
+            torch.cuda.synchronize()
+            del hs, _w1, _w2, _ids, _weights
     torch.cuda.empty_cache()
     print("[Warmup] Done.\n")
 
@@ -416,22 +491,25 @@ def main():
         else:
             dist_configs.append((dist, 0.0))
 
-    for num_tokens in args.num_tokens:
-        for dist, alpha in dist_configs:
-            results = run_benchmark(
-                cfg=cfg,
-                num_tokens=num_tokens,
-                distribution=dist,
-                zipf_alpha=alpha,
-                dtype=dtype,
-                approaches=args.approach,
-                num_warmup=num_warmup,
-                num_iters=num_iters,
-                profile=args.profile,
-                tp=args.tp,
-                seed=args.seed,
-            )
-            all_results.extend(results)
+    for ep_val in args.ep:
+        for num_tokens in args.num_tokens:
+            for dist, alpha in dist_configs:
+                results = run_benchmark(
+                    cfg=cfg,
+                    num_tokens=num_tokens,
+                    distribution=dist,
+                    zipf_alpha=alpha,
+                    dtype=dtype,
+                    approaches=args.approach,
+                    num_warmup=num_warmup,
+                    num_iters=num_iters,
+                    profile=args.profile,
+                    tp=args.tp,
+                    ep=ep_val,
+                    ep_rank=args.ep_rank,
+                    seed=args.seed,
+                )
+                all_results.extend(results)
 
     # Write CSV if requested
     if args.csv and all_results:
@@ -449,13 +527,14 @@ def main():
         print("SUMMARY")
         print(f"{'=' * 90}")
         print(
-            f"{'Tokens':>7} {'Distribution':<16} {'Approach':<10} "
-            f"{'Median(ms)':>10} {'Waste':>7} {'Speedup':>8}"
+            f"{'Tokens':>7} {'EP':>3} {'Local_E':>7} {'Distribution':<16} "
+            f"{'Approach':<10} {'Median(ms)':>10} {'Waste':>7} {'Speedup':>8}"
         )
-        print("-" * 62)
+        print("-" * 80)
         for r in all_results:
             print(
-                f"{r['num_tokens']:>7} {r['distribution']:<16} {r['approach']:<10} "
+                f"{r['num_tokens']:>7} {r['ep']:>3} {r['local_experts']:>7} "
+                f"{r['distribution']:<16} {r['approach']:<10} "
                 f"{r['median_ms']:>10} {r['padding_waste']:>7} {r['speedup']:>8}"
             )
 
