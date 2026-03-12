@@ -1108,7 +1108,7 @@ if kl_matrix is not None and len(kl_pairs) > 0:
 # %%
 if jsd_dist_matrix is not None and len(dataset_names) > 1:
     n_ds = len(dataset_names)
-    fig, ax = plt.subplots(figsize=(max(5, n_ds * 1.2 + 1), max(4, n_ds * 1.2)))
+    fig, ax = plt.subplots(figsize=(max(5, n_ds * 1.7 + 1), max(4, n_ds * 1.7)))
     im = ax.imshow(jsd_dist_matrix, cmap="YlOrRd", vmin=0)
     ax.set_xticks(range(n_ds))
     ax.set_yticks(range(n_ds))
