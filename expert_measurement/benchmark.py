@@ -26,7 +26,6 @@ Usage examples:
 import argparse
 import csv
 import sys
-import time
 from pathlib import Path
 
 # Allow running as both `python benchmark.py` and `python -m expert_measurement`
@@ -234,14 +233,10 @@ def run_benchmark(
     print(f"{'=' * 70}")
 
     results = []
-    fn_map = {
-        "triton": ("Triton Fused", triton_moe_forward),
-        "native": ("Native PyTorch", native_moe_forward),
-    }
 
     timings = {}
     for approach in approaches:
-        label, fn = fn_map[approach]
+        label, fn = FN_MAP[approach]
 
         if profile:
             torch.cuda.nvtx.range_push(f"benchmark_{approach}")
@@ -302,6 +297,12 @@ def run_benchmark(
     torch.cuda.empty_cache()
 
     return results
+
+
+FN_MAP = {
+    "triton": ("Triton Fused", triton_moe_forward),
+    "native": ("Native PyTorch", native_moe_forward),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +382,30 @@ def main():
         print("      or: ncu --set full -o <output> python ... --approach triton --num-tokens <N>")
 
     all_results = []
+
+    # ------------------------------------------------------------------
+    # JIT warmup: run each kernel once per unique token count to trigger
+    # Triton compilation *before* any timed benchmarking.
+    # ------------------------------------------------------------------
+    print("\n[Warmup] Pre-compiling kernels (Triton JIT) ...")
+    E_w = cfg.num_experts
+    K_w = cfg.hidden_size
+    N_w = cfg.intermediate_size // args.tp
+    for nt in sorted(set(args.num_tokens)):
+        hs = torch.randn(nt, K_w, dtype=dtype, device="cuda")
+        _w1 = torch.randn(E_w, 2 * N_w, K_w, dtype=dtype, device="cuda") * 0.01
+        _w2 = torch.randn(E_w, K_w, N_w, dtype=dtype, device="cuda") * 0.01
+        _ids, _weights = generate_expert_assignments(
+            num_tokens=nt, num_experts=E_w, top_k=cfg.top_k,
+            distribution="uniform", zipf_alpha=0.0, seed=0,
+        )
+        for approach in args.approach:
+            fn = FN_MAP[approach][1]
+            fn(hs, _w1, _w2, _weights, _ids)
+        torch.cuda.synchronize()
+        del hs, _w1, _w2, _ids, _weights
+    torch.cuda.empty_cache()
+    print("[Warmup] Done.\n")
 
     # Build the sweep: (distribution, zipf_alpha) pairs
     dist_configs = []
