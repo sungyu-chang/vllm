@@ -4,11 +4,14 @@
 # Default model preset
 default_model := "mixtral-8x7b"
 
+# Directory containing this justfile
+bench_dir := justfile_directory()
+
 # ─── Quick runs ───────────────────────────────────────────────────────
 
 # Run a quick benchmark with a preset model
 quick model=default_model:
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model {{model}} \
         --num-tokens 32 128 512 \
         --distribution uniform zipf \
@@ -17,7 +20,7 @@ quick model=default_model:
 
 # Run with a HuggingFace model (downloads config only)
 hf-quick hf_model:
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --hf-model {{hf_model}} \
         --num-tokens 32 128 512 \
         --distribution uniform zipf \
@@ -28,37 +31,37 @@ hf-quick hf_model:
 
 # Full sweep across token counts and distributions
 sweep model=default_model:
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model {{model}} \
         --num-tokens 1 8 32 128 512 1024 2048 \
         --distribution uniform zipf single_hot \
         --zipf-alpha 0.0 0.5 1.0 1.5 2.0 \
         --num-iters 100 \
-        --csv expert_measurement/results/{{model}}_sweep.csv
+        --csv {{bench_dir}}/results/{{model}}_sweep.csv
 
 # Sweep only skewness for a fixed token count
 skew-sweep model=default_model tokens="512":
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model {{model}} \
         --num-tokens {{tokens}} \
         --distribution uniform zipf single_hot \
         --zipf-alpha 0.0 0.25 0.5 0.75 1.0 1.5 2.0 \
         --num-iters 100 \
-        --csv expert_measurement/results/{{model}}_skew_{{tokens}}.csv
+        --csv {{bench_dir}}/results/{{model}}_skew_{{tokens}}.csv
 
 # Compare multiple models at a fixed workload
 compare-models tokens="512":
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model mixtral-8x7b \
         --num-tokens {{tokens}} \
         --distribution uniform zipf --zipf-alpha 1.0 \
         --num-iters 100
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model deepseek-v2-lite \
         --num-tokens {{tokens}} \
         --distribution uniform zipf --zipf-alpha 1.0 \
         --num-iters 100
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model qwen2-57b-a14b \
         --num-tokens {{tokens}} \
         --distribution uniform zipf --zipf-alpha 1.0 \
@@ -68,12 +71,12 @@ compare-models tokens="512":
 
 # Profile with nsys (generates .nsys-rep file)
 nsys-profile model=default_model tokens="512" approach="triton" dist="uniform":
-    mkdir -p expert_measurement/profiles
+    mkdir -p {{bench_dir}}/profiles
     nsys profile \
         --capture-range=cudaProfilerApi \
         --capture-range-end=stop \
-        -o expert_measurement/profiles/{{model}}_{{approach}}_{{dist}}_{{tokens}} \
-        python -m expert_measurement.benchmark \
+        -o {{bench_dir}}/profiles/{{model}}_{{approach}}_{{dist}}_{{tokens}} \
+        python {{bench_dir}}/benchmark.py \
             --model {{model}} \
             --num-tokens {{tokens}} \
             --distribution {{dist}} \
@@ -82,12 +85,12 @@ nsys-profile model=default_model tokens="512" approach="triton" dist="uniform":
 
 # Profile both approaches with nsys
 nsys-compare model=default_model tokens="512" dist="uniform":
-    mkdir -p expert_measurement/profiles
+    mkdir -p {{bench_dir}}/profiles
     nsys profile \
         --capture-range=cudaProfilerApi \
         --capture-range-end=stop \
-        -o expert_measurement/profiles/{{model}}_both_{{dist}}_{{tokens}} \
-        python -m expert_measurement.benchmark \
+        -o {{bench_dir}}/profiles/{{model}}_both_{{dist}}_{{tokens}} \
+        python {{bench_dir}}/benchmark.py \
             --model {{model}} \
             --num-tokens {{tokens}} \
             --distribution {{dist}} \
@@ -96,11 +99,11 @@ nsys-compare model=default_model tokens="512" dist="uniform":
 
 # Profile with ncu (very slow, single approach recommended)
 ncu-profile model=default_model tokens="512" approach="triton" dist="uniform":
-    mkdir -p expert_measurement/profiles
+    mkdir -p {{bench_dir}}/profiles
     ncu --set full \
         --target-processes all \
-        -o expert_measurement/profiles/{{model}}_{{approach}}_{{dist}}_{{tokens}}_ncu \
-        python -m expert_measurement.benchmark \
+        -o {{bench_dir}}/profiles/{{model}}_{{approach}}_{{dist}}_{{tokens}}_ncu \
+        python {{bench_dir}}/benchmark.py \
             --model {{model}} \
             --num-tokens {{tokens}} \
             --distribution {{dist}} \
@@ -112,7 +115,7 @@ ncu-profile model=default_model tokens="512" approach="triton" dist="uniform":
 
 # Benchmark only the Triton kernel
 triton-only model=default_model:
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model {{model}} \
         --num-tokens 32 128 512 1024 \
         --distribution uniform zipf --zipf-alpha 0.0 1.0 2.0 \
@@ -121,7 +124,7 @@ triton-only model=default_model:
 
 # Benchmark only the native PyTorch approach
 native-only model=default_model:
-    python -m expert_measurement.benchmark \
+    python {{bench_dir}}/benchmark.py \
         --model {{model}} \
         --num-tokens 32 128 512 1024 \
         --distribution uniform zipf --zipf-alpha 0.0 1.0 2.0 \
@@ -132,8 +135,8 @@ native-only model=default_model:
 
 # List available model presets
 list-presets:
-    python -m expert_measurement.benchmark --list-presets
+    python {{bench_dir}}/benchmark.py --list-presets
 
 # Clean generated results and profiles
 clean:
-    rm -rf expert_measurement/results expert_measurement/profiles
+    rm -rf {{bench_dir}}/results {{bench_dir}}/profiles

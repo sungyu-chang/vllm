@@ -29,6 +29,11 @@ import sys
 import time
 from pathlib import Path
 
+# Allow running as both `python benchmark.py` and `python -m expert_measurement`
+_this_dir = Path(__file__).resolve().parent
+if str(_this_dir.parent) not in sys.path:
+    sys.path.insert(0, str(_this_dir.parent))
+
 import numpy as np
 import torch
 
