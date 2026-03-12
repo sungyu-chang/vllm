@@ -77,8 +77,11 @@ def native_moe_forward(
         mask = flat_ids == i
         if mask.any():
             tmp1 = a[mask] @ w1[i].transpose(0, 1)
-            d = tmp1.shape[-1] // 2
-            tmp2 = torch.nn.functional.silu(tmp1[..., :d]) * tmp1[..., d:]
+            tmp2 = torch.empty(
+                tmp1.shape[0], tmp1.shape[1] // 2,
+                dtype=tmp1.dtype, device=tmp1.device,
+            )
+            torch.ops._C.silu_and_mul(tmp2, tmp1)
             out[mask] = tmp2 @ w2[i].transpose(0, 1)
 
     return (
