@@ -19,6 +19,10 @@ Usage examples:
     python expert_measurement/benchmark.py --model mixtral-8x7b \
         --num-tokens 128 512 --ep 1 2 4
 
+    # Single-expert: measure raw matmul efficiency at various batch sizes
+    python expert_measurement/benchmark.py --model mixtral-8x7b \
+        --single-expert --batch-sizes 1 4 16 64 256 1024
+
     # Profile mode for nsys/ncu
     python expert_measurement/benchmark.py --model mixtral-8x7b --num-tokens 512 \
         --profile --approach triton
@@ -120,49 +124,6 @@ def triton_moe_forward(
 
 
 # ---------------------------------------------------------------------------
-# Expert-parallelism helpers
-# ---------------------------------------------------------------------------
-
-
-def filter_for_ep_rank(
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    num_experts: int,
-    ep: int,
-    ep_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Filter routing to only include experts hosted on *ep_rank*.
-
-    With expert parallelism degree ``ep``, each rank hosts
-    ``num_experts // ep`` contiguous experts.  Tokens routed to non-local
-    experts are dropped (they'd be on another GPU in a real system).
-
-    Returns:
-        topk_ids:   remapped to local expert indices [0, local_E)
-        topk_weights: re-normalised per token
-        local_E:    number of local experts
-    """
-    local_E = num_experts // ep
-    start = ep_rank * local_E
-    end = start + local_E
-
-    # Mask: True where the assignment is to a local expert
-    local_mask = (topk_ids >= start) & (topk_ids < end)  # [M, top_k]
-
-    # Remap expert ids to local range
-    local_ids = topk_ids - start  # shift to [0, local_E)
-    # Set non-local slots to -1 (they won't match any expert in the loop)
-    local_ids = torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
-
-    # Zero out non-local weights and re-normalise
-    local_weights = topk_weights * local_mask.float()
-    row_sums = local_weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
-    local_weights = local_weights / row_sums
-
-    return local_ids, local_weights, local_E
-
-
-# ---------------------------------------------------------------------------
 # Padding waste estimation
 # ---------------------------------------------------------------------------
 
@@ -242,34 +203,26 @@ def run_benchmark(
     profile: bool,
     tp: int,
     ep: int,
-    ep_rank: int,
     seed: int,
 ) -> list[dict]:
     """Run benchmark for a single configuration, return result rows."""
     E = cfg.num_experts
+    E_local = E // ep
     K = cfg.hidden_size
     N = cfg.intermediate_size // tp  # Simulate TP sharding
+    top_k = min(cfg.top_k, E_local)
 
-    # Generate routing over *all* experts (full router view)
+    # Generate routing directly among local experts
     topk_ids, topk_weights = generate_expert_assignments(
         num_tokens=num_tokens,
-        num_experts=E,
-        top_k=cfg.top_k,
+        num_experts=E_local,
+        top_k=top_k,
         distribution=distribution,
         zipf_alpha=zipf_alpha,
         seed=seed,
     )
 
-    dist_stats = get_distribution_stats(topk_ids, E)
-
-    # Apply expert parallelism: keep only local experts
-    if ep > 1:
-        topk_ids, topk_weights, E_local = filter_for_ep_rank(
-            topk_ids, topk_weights, E, ep, ep_rank,
-        )
-    else:
-        E_local = E
-
+    dist_stats = get_distribution_stats(topk_ids, E_local)
     waste = estimate_padding_waste(topk_ids, E_local)
 
     # Generate data — weights are sized for local experts only
@@ -281,10 +234,10 @@ def run_benchmark(
     if distribution == "zipf":
         dist_label = f"zipf(a={zipf_alpha})"
 
-    ep_info = f", EP={ep}, rank={ep_rank}, local_E={E_local}" if ep > 1 else ""
+    ep_info = f", EP={ep}, local_E={E_local}" if ep > 1 else ""
     print(f"\n{'=' * 70}")
     print(
-        f"Model: {cfg.model_name} (E={E}, top_k={cfg.top_k}, "
+        f"Model: {cfg.model_name} (E={E}, top_k={top_k}, "
         f"H={K}, N={N}{f', TP={tp}' if tp > 1 else ''}{ep_info})"
     )
     print(f"Dtype: {dtype}, Tokens: {num_tokens}, Distribution: {dist_label}")
@@ -338,7 +291,7 @@ def run_benchmark(
             "num_experts": E,
             "local_experts": E_local,
             "ep": ep,
-            "top_k": cfg.top_k,
+            "top_k": top_k,
             "hidden_size": K,
             "intermediate_size": N,
             "num_tokens": num_tokens,
@@ -367,6 +320,92 @@ FN_MAP = {
 }
 
 
+def run_single_expert_benchmark(
+    cfg: MoEModelConfig,
+    batch_sizes: list[int],
+    dtype: torch.dtype,
+    approaches: list[str],
+    num_warmup: int,
+    num_iters: int,
+    profile: bool,
+    tp: int,
+) -> list[dict]:
+    """Benchmark a single expert (E=1, top_k=1) at various batch sizes.
+
+    This isolates the raw matmul + activation cost without any multi-expert
+    routing overhead, providing a efficiency baseline for comparison.
+    """
+    K = cfg.hidden_size
+    N = cfg.intermediate_size // tp
+
+    print(f"\n{'=' * 70}")
+    print(f"SINGLE EXPERT BENCHMARK  (H={K}, N={N}"
+          f"{f', TP={tp}' if tp > 1 else ''})")
+    print(f"Batch sizes: {batch_sizes}")
+    print(f"{'=' * 70}")
+
+    results = []
+    for bs in batch_sizes:
+        hidden_states = torch.randn(bs, K, dtype=dtype, device="cuda")
+        w1 = torch.randn(1, 2 * N, K, dtype=dtype, device="cuda") * 0.01
+        w2 = torch.randn(1, K, N, dtype=dtype, device="cuda") * 0.01
+        topk_ids = torch.zeros(bs, 1, dtype=torch.int32, device="cuda")
+        topk_weights = torch.ones(bs, 1, dtype=torch.float32, device="cuda")
+
+        timings = {}
+        for approach in approaches:
+            label, fn = FN_MAP[approach]
+            times = benchmark_single(
+                fn=fn,
+                args=(hidden_states, w1, w2, topk_weights, topk_ids),
+                num_warmup=num_warmup,
+                num_iters=num_iters,
+                profile=profile,
+                label=f"single_{approach}_bs{bs}",
+            )
+            times_np = np.array(times)
+            timings[approach] = times_np
+            print(
+                f"  bs={bs:<6} {label:<16}: "
+                f"mean={times_np.mean():.3f}ms, "
+                f"median={np.median(times_np):.3f}ms, "
+                f"min={times_np.min():.3f}ms"
+            )
+
+        if "triton" in timings and "native" in timings:
+            speedup = np.median(timings["native"]) / np.median(timings["triton"])
+        else:
+            speedup = None
+
+        for approach in approaches:
+            t = timings[approach]
+            results.append({
+                "model": cfg.model_name,
+                "num_experts": 1,
+                "local_experts": 1,
+                "ep": cfg.num_experts,
+                "top_k": 1,
+                "hidden_size": K,
+                "intermediate_size": N,
+                "num_tokens": bs,
+                "distribution": "single_expert",
+                "gini": "0.000",
+                "padding_waste": "0.000",
+                "approach": approach,
+                "mean_ms": f"{t.mean():.3f}",
+                "median_ms": f"{np.median(t):.3f}",
+                "min_ms": f"{t.min():.3f}",
+                "max_ms": f"{t.max():.3f}",
+                "std_ms": f"{t.std():.3f}",
+                "speedup": f"{speedup:.2f}" if speedup else "",
+            })
+
+        del hidden_states, w1, w2, topk_ids, topk_weights
+
+    torch.cuda.empty_cache()
+    return results
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -389,7 +428,6 @@ def parse_args():
     g.add_argument("--intermediate-size", type=int, help="Override: intermediate dim")
     g.add_argument("--tp", type=int, default=1, help="Simulate tensor parallelism (divides intermediate_size)")
     g.add_argument("--ep", type=int, nargs="+", default=[1], help="Expert parallelism degrees to sweep (e.g. 1 2 4)")
-    g.add_argument("--ep-rank", type=int, default=0, help="Which EP rank to simulate (default: 0)")
     g.add_argument("--list-presets", action="store_true", help="List presets and exit")
 
     # Workload
@@ -403,6 +441,8 @@ def parse_args():
     # Benchmark control
     g3 = p.add_argument_group("Benchmark control")
     g3.add_argument("--approach", type=str, nargs="+", default=["triton", "native"], choices=["triton", "native"], help="Which approaches to benchmark")
+    g3.add_argument("--single-expert", action="store_true", help="Run single-expert benchmark (E=1, top_k=1) to measure raw matmul efficiency")
+    g3.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512], help="Batch sizes for --single-expert mode")
     g3.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations")
     g3.add_argument("--num-iters", type=int, default=100, help="Timed iterations")
 
@@ -442,9 +482,6 @@ def main():
             print(f"Error: --ep {ep_val} does not evenly divide "
                   f"num_experts={cfg.num_experts}")
             sys.exit(1)
-        if args.ep_rank >= ep_val:
-            print(f"Error: --ep-rank {args.ep_rank} must be < --ep {ep_val}")
-            sys.exit(1)
 
     num_iters = args.profile_iters if args.profile else args.num_iters
     num_warmup = 2 if args.profile else args.num_warmup
@@ -464,21 +501,31 @@ def main():
     print("\n[Warmup] Pre-compiling kernels (Triton JIT) ...")
     K_w = cfg.hidden_size
     N_w = cfg.intermediate_size // args.tp
-    for ep_val in sorted(set(args.ep)):
+
+    # Collect all (E_local, token_count) pairs we'll benchmark
+    warmup_configs: set[tuple[int, int]] = set()
+    for ep_val in args.ep:
         E_local = cfg.num_experts // ep_val
-        for nt in sorted(set(args.num_tokens)):
-            hs = torch.randn(nt, K_w, dtype=dtype, device="cuda")
-            _w1 = torch.randn(E_local, 2 * N_w, K_w, dtype=dtype, device="cuda") * 0.01
-            _w2 = torch.randn(E_local, K_w, N_w, dtype=dtype, device="cuda") * 0.01
-            _ids, _weights = generate_expert_assignments(
-                num_tokens=nt, num_experts=E_local, top_k=cfg.top_k,
-                distribution="uniform", zipf_alpha=0.0, seed=0,
-            )
-            for approach in args.approach:
-                fn = FN_MAP[approach][1]
-                fn(hs, _w1, _w2, _weights, _ids)
-            torch.cuda.synchronize()
-            del hs, _w1, _w2, _ids, _weights
+        for nt in args.num_tokens:
+            warmup_configs.add((E_local, nt))
+    if args.single_expert:
+        for bs in args.batch_sizes:
+            warmup_configs.add((1, bs))
+
+    for E_local, nt in sorted(warmup_configs):
+        top_k_w = min(cfg.top_k, E_local)
+        hs = torch.randn(nt, K_w, dtype=dtype, device="cuda")
+        _w1 = torch.randn(E_local, 2 * N_w, K_w, dtype=dtype, device="cuda") * 0.01
+        _w2 = torch.randn(E_local, K_w, N_w, dtype=dtype, device="cuda") * 0.01
+        _ids, _weights = generate_expert_assignments(
+            num_tokens=nt, num_experts=E_local, top_k=top_k_w,
+            distribution="uniform", zipf_alpha=0.0, seed=0,
+        )
+        for approach in args.approach:
+            fn = FN_MAP[approach][1]
+            fn(hs, _w1, _w2, _weights, _ids)
+        torch.cuda.synchronize()
+        del hs, _w1, _w2, _ids, _weights
     torch.cuda.empty_cache()
     print("[Warmup] Done.\n")
 
@@ -506,10 +553,23 @@ def main():
                     profile=args.profile,
                     tp=args.tp,
                     ep=ep_val,
-                    ep_rank=args.ep_rank,
                     seed=args.seed,
                 )
                 all_results.extend(results)
+
+    # Single-expert benchmark
+    if args.single_expert:
+        results = run_single_expert_benchmark(
+            cfg=cfg,
+            batch_sizes=args.batch_sizes,
+            dtype=dtype,
+            approaches=args.approach,
+            num_warmup=num_warmup,
+            num_iters=num_iters,
+            profile=args.profile,
+            tp=args.tp,
+        )
+        all_results.extend(results)
 
     # Write CSV if requested
     if args.csv and all_results:
