@@ -64,8 +64,6 @@ def native_moe_forward(
 
     Mirrors the reference implementation from tests/kernels/utils.py:torch_experts.
     """
-    from vllm.model_executor.layers.activation import SiluAndMul
-
     M, K = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_experts = w1.shape[0]
@@ -74,13 +72,13 @@ def native_moe_forward(
     out = torch.zeros(M * top_k, w2.shape[1], dtype=a.dtype, device=a.device)
 
     flat_ids = topk_ids.view(-1)
-    act_fn = SiluAndMul()
 
     for i in range(num_experts):
         mask = flat_ids == i
         if mask.any():
             tmp1 = a[mask] @ w1[i].transpose(0, 1)
-            tmp2 = act_fn(tmp1)
+            d = tmp1.shape[-1] // 2
+            tmp2 = torch.nn.functional.silu(tmp1[..., :d]) * tmp1[..., d:]
             out[mask] = tmp2 @ w2[i].transpose(0, 1)
 
     return (
