@@ -19,9 +19,10 @@ Usage examples:
     python expert_measurement/benchmark.py --model mixtral-8x7b \
         --num-tokens 128 512 --ep 1 2 4
 
-    # Single-expert: measure raw matmul efficiency at various batch sizes
+    # Single-expert comparison: multi-hosted (E_local allocated, 1 active)
+    # vs single-hosted (1 allocated) at various batch sizes
     python expert_measurement/benchmark.py --model mixtral-8x7b \
-        --single-expert --batch-sizes 1 4 16 64 256 1024
+        --single-expert --ep 1 2 4 8 --batch-sizes 1 4 16 64 256 1024
 
     # Profile mode for nsys/ncu
     python expert_measurement/benchmark.py --model mixtral-8x7b --num-tokens 512 \
@@ -320,7 +321,7 @@ FN_MAP = {
 }
 
 
-def run_single_expert_benchmark(
+def run_single_expert_comparison(
     cfg: MoEModelConfig,
     batch_sizes: list[int],
     dtype: torch.dtype,
@@ -329,80 +330,139 @@ def run_single_expert_benchmark(
     num_iters: int,
     profile: bool,
     tp: int,
+    ep_values: list[int],
 ) -> list[dict]:
-    """Benchmark a single expert (E=1, top_k=1) at various batch sizes.
+    """Compare multi-expert-hosted (single activated) vs single-expert-hosted.
 
-    This isolates the raw matmul + activation cost without any multi-expert
-    routing overhead, providing a efficiency baseline for comparison.
+    For each batch size and EP value, runs two cases:
+      - "multi_hosted":  Allocate E_local expert weights, route all tokens
+                         to expert 0.  Simulates an EP rank where only one
+                         expert receives traffic while others sit in memory.
+      - "single_hosted": Allocate only 1 expert weight, route all tokens to
+                         expert 0.  Pure efficiency baseline.
+
+    The difference reveals overhead from unused expert weights occupying GPU
+    memory (cache pollution, TLB pressure, etc.).
     """
+    E = cfg.num_experts
     K = cfg.hidden_size
     N = cfg.intermediate_size // tp
 
     print(f"\n{'=' * 70}")
-    print(f"SINGLE EXPERT BENCHMARK  (H={K}, N={N}"
+    print("SINGLE-EXPERT COMPARISON: multi-hosted vs single-hosted")
+    print(f"  Model: {cfg.model_name} (E={E}, H={K}, N={N}"
           f"{f', TP={tp}' if tp > 1 else ''})")
-    print(f"Batch sizes: {batch_sizes}")
+    print(f"  EP values: {ep_values}  |  Batch sizes: {batch_sizes}")
     print(f"{'=' * 70}")
 
     results = []
-    for bs in batch_sizes:
-        hidden_states = torch.randn(bs, K, dtype=dtype, device="cuda")
-        w1 = torch.randn(1, 2 * N, K, dtype=dtype, device="cuda") * 0.01
-        w2 = torch.randn(1, K, N, dtype=dtype, device="cuda") * 0.01
-        topk_ids = torch.zeros(bs, 1, dtype=torch.int32, device="cuda")
-        topk_weights = torch.ones(bs, 1, dtype=torch.float32, device="cuda")
 
-        timings = {}
-        for approach in approaches:
-            label, fn = FN_MAP[approach]
-            times = benchmark_single(
-                fn=fn,
-                args=(hidden_states, w1, w2, topk_weights, topk_ids),
-                num_warmup=num_warmup,
-                num_iters=num_iters,
-                profile=profile,
-                label=f"single_{approach}_bs{bs}",
-            )
-            times_np = np.array(times)
-            timings[approach] = times_np
-            print(
-                f"  bs={bs:<6} {label:<16}: "
-                f"mean={times_np.mean():.3f}ms, "
-                f"median={np.median(times_np):.3f}ms, "
-                f"min={times_np.min():.3f}ms"
-            )
+    for ep_val in ep_values:
+        E_local = E // ep_val
 
-        if "triton" in timings and "native" in timings:
-            speedup = np.median(timings["native"]) / np.median(timings["triton"])
-        else:
-            speedup = None
+        print(f"\n--- EP={ep_val} → E_local={E_local} ---")
 
-        for approach in approaches:
-            t = timings[approach]
-            results.append({
-                "model": cfg.model_name,
-                "num_experts": 1,
-                "local_experts": 1,
-                "ep": cfg.num_experts,
-                "top_k": 1,
-                "hidden_size": K,
-                "intermediate_size": N,
-                "num_tokens": bs,
-                "distribution": "single_expert",
-                "gini": "0.000",
-                "padding_waste": "0.000",
-                "approach": approach,
-                "mean_ms": f"{t.mean():.3f}",
-                "median_ms": f"{np.median(t):.3f}",
-                "min_ms": f"{t.min():.3f}",
-                "max_ms": f"{t.max():.3f}",
-                "std_ms": f"{t.std():.3f}",
-                "speedup": f"{speedup:.2f}" if speedup else "",
-            })
+        for bs in batch_sizes:
+            hidden_states = torch.randn(bs, K, dtype=dtype, device="cuda")
+            topk_ids = torch.zeros(bs, 1, dtype=torch.int32, device="cuda")
+            topk_weights = torch.ones(bs, 1, dtype=torch.float32, device="cuda")
 
-        del hidden_states, w1, w2, topk_ids, topk_weights
+            # Case A: multi-expert hosted, single activated
+            w1_multi = torch.randn(
+                E_local, 2 * N, K, dtype=dtype, device="cuda") * 0.01
+            w2_multi = torch.randn(
+                E_local, K, N, dtype=dtype, device="cuda") * 0.01
 
-    torch.cuda.empty_cache()
+            # Case B: single expert hosted
+            w1_single = torch.randn(
+                1, 2 * N, K, dtype=dtype, device="cuda") * 0.01
+            w2_single = torch.randn(
+                1, K, N, dtype=dtype, device="cuda") * 0.01
+
+            for approach in approaches:
+                label, fn = FN_MAP[approach]
+
+                # Run multi-hosted case
+                times_multi = benchmark_single(
+                    fn=fn,
+                    args=(hidden_states, w1_multi, w2_multi,
+                          topk_weights, topk_ids),
+                    num_warmup=num_warmup,
+                    num_iters=num_iters,
+                    profile=profile,
+                    label=f"multi_{approach}_ep{ep_val}_bs{bs}",
+                )
+                t_multi = np.array(times_multi)
+
+                # Run single-hosted case
+                times_single = benchmark_single(
+                    fn=fn,
+                    args=(hidden_states, w1_single, w2_single,
+                          topk_weights, topk_ids),
+                    num_warmup=num_warmup,
+                    num_iters=num_iters,
+                    profile=profile,
+                    label=f"single_{approach}_bs{bs}",
+                )
+                t_single = np.array(times_single)
+
+                overhead = (np.median(t_multi) / np.median(t_single) - 1) * 100
+                print(
+                    f"  bs={bs:<6} {label:<16}: "
+                    f"multi={np.median(t_multi):.3f}ms, "
+                    f"single={np.median(t_single):.3f}ms, "
+                    f"overhead={overhead:+.1f}%"
+                )
+
+                # Record multi-hosted result
+                results.append({
+                    "model": cfg.model_name,
+                    "num_experts": E,
+                    "local_experts": E_local,
+                    "ep": ep_val,
+                    "top_k": 1,
+                    "hidden_size": K,
+                    "intermediate_size": N,
+                    "num_tokens": bs,
+                    "distribution": f"single_active(E_local={E_local})",
+                    "gini": "1.000",
+                    "padding_waste": "0.000",
+                    "approach": approach,
+                    "mean_ms": f"{t_multi.mean():.3f}",
+                    "median_ms": f"{np.median(t_multi):.3f}",
+                    "min_ms": f"{t_multi.min():.3f}",
+                    "max_ms": f"{t_multi.max():.3f}",
+                    "std_ms": f"{t_multi.std():.3f}",
+                    "speedup": "",
+                })
+
+                # Record single-hosted result
+                results.append({
+                    "model": cfg.model_name,
+                    "num_experts": E,
+                    "local_experts": 1,
+                    "ep": E,
+                    "top_k": 1,
+                    "hidden_size": K,
+                    "intermediate_size": N,
+                    "num_tokens": bs,
+                    "distribution": "single_hosted",
+                    "gini": "0.000",
+                    "padding_waste": "0.000",
+                    "approach": approach,
+                    "mean_ms": f"{t_single.mean():.3f}",
+                    "median_ms": f"{np.median(t_single):.3f}",
+                    "min_ms": f"{t_single.min():.3f}",
+                    "max_ms": f"{t_single.max():.3f}",
+                    "std_ms": f"{t_single.std():.3f}",
+                    "speedup": "",
+                })
+
+            del hidden_states, topk_ids, topk_weights
+            del w1_multi, w2_multi, w1_single, w2_single
+
+        torch.cuda.empty_cache()
+
     return results
 
 
@@ -441,8 +501,8 @@ def parse_args():
     # Benchmark control
     g3 = p.add_argument_group("Benchmark control")
     g3.add_argument("--approach", type=str, nargs="+", default=["triton", "native"], choices=["triton", "native"], help="Which approaches to benchmark")
-    g3.add_argument("--single-expert", action="store_true", help="Run single-expert benchmark (E=1, top_k=1) to measure raw matmul efficiency")
-    g3.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512], help="Batch sizes for --single-expert mode")
+    g3.add_argument("--single-expert", action="store_true", help="Compare multi-expert-hosted (1 active) vs single-expert-hosted at various batch sizes")
+    g3.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512], help="Batch sizes for --single-expert comparison")
     g3.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations")
     g3.add_argument("--num-iters", type=int, default=100, help="Timed iterations")
 
@@ -509,8 +569,11 @@ def main():
         for nt in args.num_tokens:
             warmup_configs.add((E_local, nt))
     if args.single_expert:
-        for bs in args.batch_sizes:
-            warmup_configs.add((1, bs))
+        for ep_val in args.ep:
+            E_local = cfg.num_experts // ep_val
+            for bs in args.batch_sizes:
+                warmup_configs.add((E_local, bs))
+                warmup_configs.add((1, bs))
 
     for E_local, nt in sorted(warmup_configs):
         top_k_w = min(cfg.top_k, E_local)
@@ -557,9 +620,9 @@ def main():
                 )
                 all_results.extend(results)
 
-    # Single-expert benchmark
+    # Single-expert comparison: multi-hosted vs single-hosted
     if args.single_expert:
-        results = run_single_expert_benchmark(
+        results = run_single_expert_comparison(
             cfg=cfg,
             batch_sizes=args.batch_sizes,
             dtype=dtype,
@@ -568,6 +631,7 @@ def main():
             num_iters=num_iters,
             profile=args.profile,
             tp=args.tp,
+            ep_values=args.ep,
         )
         all_results.extend(results)
 
