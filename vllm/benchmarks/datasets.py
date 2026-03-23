@@ -77,6 +77,8 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    # Optional absolute arrival time in seconds from dataset traces.
+    arrival_time_s: float | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -1349,6 +1351,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         choices=[
             "sharegpt",
             "burstgpt",
+            "servegen",
             "sonnet",
             "random",
             "random-mm",
@@ -1447,6 +1450,22 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=None,
         help="Output length for each request. Overrides the output length "
         "from the ShareGPT dataset.",
+    )
+
+    servegen_group = parser.add_argument_group("servegen dataset options")
+    servegen_group.add_argument(
+        "--servegen-input-len",
+        type=int,
+        default=None,
+        help="Input length override for ServeGen dataset. If not set, uses "
+        "input_tokens from the trace.",
+    )
+    servegen_group.add_argument(
+        "--servegen-output-len",
+        type=int,
+        default=None,
+        help="Output length override for ServeGen dataset. If not set, uses "
+        "output_tokens from the trace.",
     )
 
     blazedit_group = parser.add_argument_group("blazedit dataset options")
@@ -1934,6 +1953,18 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 request_id_prefix=args.request_id_prefix,
                 no_oversample=args.no_oversample,
             ),
+            "servegen": lambda: ServeGenDataset(
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                disable_shuffle=args.disable_shuffle,
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                request_id_prefix=args.request_id_prefix,
+                no_oversample=args.no_oversample,
+                input_len=args.servegen_input_len,
+                output_len=args.servegen_output_len,
+            ),
             "random": lambda: RandomDataset(
                 random_seed=args.seed,
                 dataset_path=args.dataset_path,
@@ -2372,6 +2403,9 @@ class BurstGPTDataset(BenchmarkDataset):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.input_tokens_col: str | None = None
+        self.output_tokens_col: str | None = None
+        self.timestamp_col: str | None = None
         self.load_data()
 
     def load_data(
@@ -2381,24 +2415,58 @@ class BurstGPTDataset(BenchmarkDataset):
             raise ValueError("dataset_path must be provided for loading data.")
 
         df = pd.read_csv(self.dataset_path)
-        # Filter to keep only GPT-4 rows.
-        gpt4_df = df[df["Model"] == "GPT-4"]
-        # Remove failed requests (where Response tokens is 0 or less).
-        gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
-        # Sample the desired number of rows.
-        self.data = gpt4_df
+        input_candidates = ["Request tokens", "input_tokens"]
+        output_candidates = ["Response tokens", "output_tokens"]
 
-    def _sample_loaded_data(self, num_requests: int) -> list:
-        if num_requests <= len(self.data):
-            data = self.data.sample(n=num_requests, random_state=self.random_seed)
-        else:
-            data = self.data.sample(
-                n=num_requests,
-                random_state=self.random_seed,
-                replace=True,
+        self.input_tokens_col = next(
+            (c for c in input_candidates if c in df.columns), None
+        )
+        self.output_tokens_col = next(
+            (c for c in output_candidates if c in df.columns), None
+        )
+        if self.input_tokens_col is None or self.output_tokens_col is None:
+            raise ValueError(
+                "BurstGPT CSV must contain request/response token columns. "
+                f"Found columns: {list(df.columns)}"
             )
-        # Convert the dataframe to a list of lists.
-        return data.values.tolist()
+
+        if "Model" in df.columns:
+            df = df[df["Model"] == "GPT-4"]
+
+        df[self.input_tokens_col] = pd.to_numeric(df[self.input_tokens_col], errors="coerce")
+        df[self.output_tokens_col] = pd.to_numeric(
+            df[self.output_tokens_col], errors="coerce"
+        )
+        df = df.dropna(subset=[self.input_tokens_col, self.output_tokens_col])
+        df = df[df[self.output_tokens_col] > 0]
+
+        for ts_col in ("timestamp", "Timestamp"):
+            if ts_col in df.columns:
+                self.timestamp_col = ts_col
+                break
+        if self.timestamp_col is not None:
+            df[self.timestamp_col] = pd.to_numeric(df[self.timestamp_col], errors="coerce")
+            df = df.dropna(subset=[self.timestamp_col])
+            df = df.sort_values(self.timestamp_col, kind="stable")
+
+        self.data = df.reset_index(drop=True)
+
+    def _sample_loaded_data(self, num_requests: int) -> Any:
+        if self.timestamp_col is not None:
+            if num_requests > len(self.data):
+                raise ValueError(
+                    "Timestamped BurstGPT traces should not be oversampled. "
+                    f"Requested {num_requests}, available {len(self.data)}."
+                )
+            return self.data.iloc[:num_requests]
+
+        if num_requests <= len(self.data):
+            return self.data.sample(n=num_requests, random_state=self.random_seed)
+        return self.data.sample(
+            n=num_requests,
+            random_state=self.random_seed,
+            replace=True,
+        )
 
     def sample(
         self,
@@ -2413,8 +2481,11 @@ class BurstGPTDataset(BenchmarkDataset):
         samples = []
         data = self._sample_loaded_data(num_requests=num_requests)
         for i in range(num_requests):
-            input_len = int(data[i][2])
-            output_len = int(data[i][3])
+            row = data.iloc[i]
+            assert self.input_tokens_col is not None
+            assert self.output_tokens_col is not None
+            input_len = int(row[self.input_tokens_col])
+            output_len = int(row[self.output_tokens_col])
             lora_req = self.get_random_lora_request(
                 max_loras=max_loras, lora_path=lora_path
             )
@@ -2423,6 +2494,9 @@ class BurstGPTDataset(BenchmarkDataset):
             # j) modulo vocab_size.
             token_ids = [(i + j) % vocab_size for j in range(input_len)]
             prompt = tokenizer.decode(token_ids)
+            arrival_time_s = (
+                float(row[self.timestamp_col]) if self.timestamp_col is not None else None
+            )
             samples.append(
                 SampleRequest(
                     prompt=prompt,
@@ -2430,9 +2504,104 @@ class BurstGPTDataset(BenchmarkDataset):
                     expected_output_len=output_len,
                     lora_request=lora_req,
                     request_id=request_id_prefix + str(i),
+                    arrival_time_s=arrival_time_s,
                 )
             )
         return samples
+
+
+class ServeGenDataset(BenchmarkDataset):
+    """Dataset adapter for ServeGen-generated CSV traces."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        df = pd.read_csv(self.dataset_path)
+
+        required = {"input_tokens", "output_tokens"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                "ServeGen CSV must contain columns "
+                f"{sorted(required)}, missing: {sorted(missing)}"
+            )
+
+        for col in ("input_tokens", "output_tokens"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["input_tokens", "output_tokens"])
+        df = df[(df["input_tokens"] > 0) & (df["output_tokens"] >= 0)]
+
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+            df = df.sort_values("timestamp", kind="stable")
+
+        self.data = df.reset_index(drop=True)
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        max_loras: int | None = None,
+        lora_path: str | None = None,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        input_len: int | None = None,
+        output_len: int | None = None,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        if len(self.data) == 0:
+            raise ValueError("ServeGen dataset is empty after preprocessing.")
+
+        requests: list[SampleRequest] = []
+        vocab_size = tokenizer.vocab_size
+
+        for i in range(len(self.data)):
+            row = self.data.iloc[i]
+            sampled_input_len = int(row["input_tokens"])
+            sampled_output_len = int(row["output_tokens"])
+
+            final_input_len = input_len if input_len is not None else sampled_input_len
+            final_output_len = (
+                output_len if output_len is not None else sampled_output_len
+            )
+
+            lora_req = self.get_random_lora_request(
+                max_loras=max_loras,
+                lora_path=lora_path,
+            )
+
+            token_ids = [(i + j) % vocab_size for j in range(final_input_len)]
+            prompt = tokenizer.decode(token_ids)
+
+            arrival_time_s = None
+            if "timestamp" in self.data.columns:
+                arrival_time_s = float(row["timestamp"])
+
+            requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=final_input_len,
+                    expected_output_len=final_output_len,
+                    lora_request=lora_req,
+                    request_id=request_id_prefix + str(i),
+                    arrival_time_s=arrival_time_s,
+                )
+            )
+
+        sampled = requests[:num_requests]
+        self.maybe_oversample_requests(
+            sampled,
+            num_requests=num_requests,
+            request_id_prefix=request_id_prefix,
+            no_oversample=no_oversample,
+        )
+        return sampled[:num_requests]
 
 
 # -----------------------------------------------------------------------------

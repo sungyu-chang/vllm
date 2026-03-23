@@ -21,6 +21,7 @@ On the client side, run:
 import argparse
 import asyncio
 import contextlib
+import csv
 import importlib.util
 import json
 import os
@@ -160,6 +161,351 @@ async def fetch_spec_decode_metrics(
         return None
 
 
+def _parse_prometheus_scalar_sums(
+    text: str, metric_names: list[str]
+) -> dict[str, float]:
+    values = {name: 0.0 for name in metric_names}
+    valid_prefixes = tuple(f"{name}" for name in metric_names)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.startswith(valid_prefixes):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        metric_name = parts[0].split("{")[0]
+        metric_key = metric_name
+        # Prometheus exposes Counter metrics with a `_total` suffix.
+        if metric_key not in values and metric_key.endswith("_total"):
+            metric_key = metric_key[: -len("_total")]
+        if metric_key not in values:
+            continue
+        with contextlib.suppress(ValueError):
+            values[metric_key] += float(parts[-1])
+    return values
+
+
+async def collect_system_metrics(
+    base_url: str,
+    session: aiohttp.ClientSession,
+    interval_s: float,
+    stop_event: asyncio.Event,
+    benchmark_start_time: float,
+    output_json_path: str | None,
+) -> list[dict[str, float]]:
+    metrics_url = f"{base_url}/metrics"
+    metric_names = [
+        "vllm:prompt_tokens",
+        "vllm:generation_tokens",
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+        "vllm:kv_cache_usage_perc",
+    ]
+    samples: list[dict[str, float]] = []
+    prev_prompt_tokens: float | None = None
+    prev_generation_tokens: float | None = None
+    prev_ts: float | None = None
+
+    output_file = None
+    if output_json_path is not None:
+        os.makedirs(os.path.dirname(output_json_path) or ".", exist_ok=True)
+        output_file = open(output_json_path, "w", encoding="utf-8")
+
+    try:
+        while not stop_event.is_set():
+            now_wall = time.time()
+            now_unix_us = int(now_wall * 1_000_000)
+            now_perf = time.perf_counter()
+            sample = {
+                "timestamp_unix_us": now_unix_us,
+                "timestamp": now_wall,
+                "elapsed_s": max(now_perf - benchmark_start_time, 0.0),
+                "prompt_tokens_total": 0.0,
+                "generation_tokens_total": 0.0,
+                "prompt_throughput_tps": 0.0,
+                "generation_throughput_tps": 0.0,
+                "num_requests_running": 0.0,
+                "batch_size_estimate": 0.0,
+                "num_requests_waiting": 0.0,
+                "num_requests_in_system": 0.0,
+                "kv_cache_usage_perc": 0.0,
+            }
+            sample_valid = False
+            try:
+                async with session.get(metrics_url) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        parsed = _parse_prometheus_scalar_sums(text, metric_names)
+                        prompt_tokens = parsed["vllm:prompt_tokens"]
+                        generation_tokens = parsed["vllm:generation_tokens"]
+                        sample["prompt_tokens_total"] = prompt_tokens
+                        sample["generation_tokens_total"] = generation_tokens
+                        sample["num_requests_running"] = parsed[
+                            "vllm:num_requests_running"
+                        ]
+                        sample["batch_size_estimate"] = sample[
+                            "num_requests_running"
+                        ]
+                        sample["num_requests_waiting"] = parsed[
+                            "vllm:num_requests_waiting"
+                        ]
+                        sample["num_requests_in_system"] = (
+                            sample["num_requests_running"]
+                            + sample["num_requests_waiting"]
+                        )
+                        sample["kv_cache_usage_perc"] = (
+                            parsed["vllm:kv_cache_usage_perc"] * 100.0
+                        )
+
+                        if (
+                            prev_prompt_tokens is not None
+                            and prev_generation_tokens is not None
+                            and prev_ts is not None
+                        ):
+                            dt = now_wall - prev_ts
+                            if dt > 0:
+                                sample["prompt_throughput_tps"] = (
+                                    prompt_tokens - prev_prompt_tokens
+                                ) / dt
+                                sample["generation_throughput_tps"] = (
+                                    generation_tokens - prev_generation_tokens
+                                ) / dt
+                        prev_prompt_tokens = prompt_tokens
+                        prev_generation_tokens = generation_tokens
+                        prev_ts = now_wall
+                        sample_valid = True
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+
+            if sample_valid:
+                samples.append(sample)
+                if output_file is not None:
+                    output_file.write(json.dumps(sample) + "\n")
+                    output_file.flush()
+
+            await asyncio.sleep(interval_s)
+    finally:
+        if output_file is not None:
+            output_file.close()
+
+    return samples
+
+
+def compute_per_second_system_metrics(
+    samples: list[dict[str, float]],
+) -> tuple[list[dict[str, float]], dict[str, float]]:
+    if len(samples) < 2:
+        return [], {
+            "avg_batch_size": 0.0,
+            "avg_queue_depth": 0.0,
+            "avg_running": 0.0,
+            "avg_waiting": 0.0,
+            "covered_duration_s": 0.0,
+        }
+
+    buckets: dict[int, dict[str, float]] = {}
+
+    def get_bucket(sec: int) -> dict[str, float]:
+        if sec not in buckets:
+            buckets[sec] = {
+                "second": float(sec),
+                "covered_s": 0.0,
+                "prompt_tokens": 0.0,
+                "generation_tokens": 0.0,
+                "running_time_area": 0.0,
+                "waiting_time_area": 0.0,
+                "queue_depth_time_area": 0.0,
+            }
+        return buckets[sec]
+
+    total_covered_s = 0.0
+    total_running_area = 0.0
+    total_waiting_area = 0.0
+    total_queue_area = 0.0
+
+    for i in range(1, len(samples)):
+        prev = samples[i - 1]
+        curr = samples[i]
+        t0 = float(prev.get("elapsed_s", 0.0))
+        t1 = float(curr.get("elapsed_s", 0.0))
+        if t1 <= t0:
+            continue
+
+        dt = t1 - t0
+        prompt_delta = max(
+            float(curr.get("prompt_tokens_total", 0.0))
+            - float(prev.get("prompt_tokens_total", 0.0)),
+            0.0,
+        )
+        generation_delta = max(
+            float(curr.get("generation_tokens_total", 0.0))
+            - float(prev.get("generation_tokens_total", 0.0)),
+            0.0,
+        )
+        prompt_rate = prompt_delta / dt
+        generation_rate = generation_delta / dt
+
+        running_avg = 0.5 * (
+            float(prev.get("num_requests_running", 0.0))
+            + float(curr.get("num_requests_running", 0.0))
+        )
+        waiting_avg = 0.5 * (
+            float(prev.get("num_requests_waiting", 0.0))
+            + float(curr.get("num_requests_waiting", 0.0))
+        )
+        queue_avg = running_avg + waiting_avg
+
+        start_sec = int(t0)
+        end_sec = int(t1)
+        for sec in range(start_sec, end_sec + 1):
+            sec_start = float(sec)
+            sec_end = float(sec + 1)
+            overlap = min(t1, sec_end) - max(t0, sec_start)
+            if overlap <= 0:
+                continue
+
+            bucket = get_bucket(sec)
+            bucket["covered_s"] += overlap
+            bucket["prompt_tokens"] += prompt_rate * overlap
+            bucket["generation_tokens"] += generation_rate * overlap
+            bucket["running_time_area"] += running_avg * overlap
+            bucket["waiting_time_area"] += waiting_avg * overlap
+            bucket["queue_depth_time_area"] += queue_avg * overlap
+
+        total_covered_s += dt
+        total_running_area += running_avg * dt
+        total_waiting_area += waiting_avg * dt
+        total_queue_area += queue_avg * dt
+
+    rows: list[dict[str, float]] = []
+    for sec in sorted(buckets):
+        b = buckets[sec]
+        covered_s = b["covered_s"]
+        if covered_s <= 0:
+            continue
+        rows.append(
+            {
+                "second": b["second"],
+                "covered_s": covered_s,
+                "prompt_throughput_tps": b["prompt_tokens"] / covered_s,
+                "generation_throughput_tps": b["generation_tokens"] / covered_s,
+                "total_throughput_tps": (
+                    b["prompt_tokens"] + b["generation_tokens"]
+                )
+                / covered_s,
+                "avg_num_requests_running": b["running_time_area"] / covered_s,
+                "avg_batch_size": b["running_time_area"] / covered_s,
+                "avg_num_requests_waiting": b["waiting_time_area"] / covered_s,
+                "avg_queue_depth": b["queue_depth_time_area"] / covered_s,
+            }
+        )
+
+    summary = {
+        "avg_batch_size": (total_running_area / total_covered_s)
+        if total_covered_s > 0
+        else 0.0,
+        "avg_queue_depth": (total_queue_area / total_covered_s)
+        if total_covered_s > 0
+        else 0.0,
+        "avg_running": (total_running_area / total_covered_s)
+        if total_covered_s > 0
+        else 0.0,
+        "avg_waiting": (total_waiting_area / total_covered_s)
+        if total_covered_s > 0
+        else 0.0,
+        "covered_duration_s": total_covered_s,
+    }
+    return rows, summary
+
+
+def compute_per_second_ttft_tbt(
+    outputs: list[RequestFuncOutput], benchmark_start_time: float
+) -> list[dict[str, float]]:
+    per_second: dict[int, dict[str, float]] = {}
+
+    def get_bucket(second: int) -> dict[str, float]:
+        if second not in per_second:
+            per_second[second] = {
+                "second": float(second),
+                "ttft_count": 0.0,
+                "ttft_sum_ms": 0.0,
+                "tbt_count": 0.0,
+                "tbt_sum_ms": 0.0,
+            }
+        return per_second[second]
+
+    for output in outputs:
+        if not output.success:
+            continue
+
+        first_token_ts = output.first_token_timestamp
+        if first_token_ts <= 0.0 and output.ttft > 0.0:
+            first_token_ts = output.start_time + output.ttft
+
+        if first_token_ts > 0.0 and output.ttft > 0.0:
+            second = int(max(first_token_ts - benchmark_start_time, 0.0))
+            bucket = get_bucket(second)
+            bucket["ttft_count"] += 1
+            bucket["ttft_sum_ms"] += output.ttft * 1000.0
+
+        token_timestamps = list(output.token_timestamps)
+        if not token_timestamps and output.ttft > 0.0:
+            t0 = output.start_time + output.ttft
+            token_timestamps = [t0]
+            current = t0
+            for itl in output.itl:
+                current += itl
+                token_timestamps.append(current)
+
+        for idx in range(1, len(token_timestamps)):
+            curr = token_timestamps[idx]
+            prev = token_timestamps[idx - 1]
+            tbt_ms = max(curr - prev, 0.0) * 1000.0
+            second = int(max(curr - benchmark_start_time, 0.0))
+            bucket = get_bucket(second)
+            bucket["tbt_count"] += 1
+            bucket["tbt_sum_ms"] += tbt_ms
+
+    rows: list[dict[str, float]] = []
+    for second in sorted(per_second):
+        bucket = per_second[second]
+        ttft_count = bucket["ttft_count"]
+        tbt_count = bucket["tbt_count"]
+        rows.append(
+            {
+                "second": bucket["second"],
+                "ttft_count": ttft_count,
+                "avg_ttft_ms": (
+                    bucket["ttft_sum_ms"] / ttft_count if ttft_count > 0 else 0.0
+                ),
+                "tbt_count": tbt_count,
+                "avg_tbt_ms": bucket["tbt_sum_ms"] / tbt_count if tbt_count > 0 else 0.0,
+            }
+        )
+    return rows
+
+
+def save_generated_trace(
+    path: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fieldnames = [
+        "request_index",
+        "request_id",
+        "dataset_arrival_time_s",
+        "request_created_at_epoch_s",
+        "request_created_at_perf_s",
+        "request_created_after_benchmark_start_s",
+        "prompt_len",
+        "expected_output_len",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as out:
+        writer = csv.DictWriter(out, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 class TaskType(Enum):
     GENERATION = "generation"
     POOLING = "pooling"
@@ -281,52 +627,63 @@ async def get_request(
     total_requests = len(input_requests)
     assert total_requests > 0, "No requests provided."
 
+    has_arrival_timestamps = any(
+        req.arrival_time_s is not None for req in input_requests
+    )
+    if has_arrival_timestamps and not all(
+        req.arrival_time_s is not None for req in input_requests
+    ):
+        raise ValueError(
+            "Dataset contains mixed timestamp availability: all requests must "
+            "either provide arrival_time_s or none should."
+        )
+
     # Precompute delays among requests to minimize request send laggings
     request_rates = []
-    delay_ts = []
-    for request_index, request in enumerate(input_requests):
-        current_request_rate = _get_current_request_rate(
-            ramp_up_strategy,
-            ramp_up_start_rps,
-            ramp_up_end_rps,
-            request_index,
-            total_requests,
-            request_rate,
-        )
-        assert current_request_rate > 0.0, (
-            f"Obtained non-positive request rate {current_request_rate}."
-        )
-        request_rates.append(current_request_rate)
-        if current_request_rate == float("inf"):
-            delay_ts.append(0)
-        elif burstiness == float("inf"):
-            # when burstiness tends to infinity, the delay time becomes constant
-            # and tends to the inverse of the request rate
-            delay_ts.append(1.0 / current_request_rate)
-        else:
-            theta = 1.0 / (current_request_rate * burstiness)
+    delay_ts: list[float] = []
+    if has_arrival_timestamps:
+        first_arrival_ts = min(float(req.arrival_time_s) for req in input_requests)
+        delay_ts = [
+            max(float(req.arrival_time_s) - first_arrival_ts, 0.0)
+            for req in input_requests
+        ]
+        request_rates = [request_rate for _ in input_requests]
+    else:
+        for request_index, request in enumerate(input_requests):
+            current_request_rate = _get_current_request_rate(
+                ramp_up_strategy,
+                ramp_up_start_rps,
+                ramp_up_end_rps,
+                request_index,
+                total_requests,
+                request_rate,
+            )
+            assert current_request_rate > 0.0, (
+                f"Obtained non-positive request rate {current_request_rate}."
+            )
+            request_rates.append(current_request_rate)
+            if current_request_rate == float("inf"):
+                delay_ts.append(0)
+            elif burstiness == float("inf"):
+                # when burstiness tends to infinity, the delay time becomes
+                # constant and tends to the inverse of the request rate
+                delay_ts.append(1.0 / current_request_rate)
+            else:
+                theta = 1.0 / (current_request_rate * burstiness)
 
-            # Sample the request interval from the gamma distribution.
-            # If burstiness is 1, it follows exponential distribution.
-            delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
+                # Sample the request interval from the gamma distribution.
+                # If burstiness is 1, it follows exponential distribution.
+                delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
 
-    # Calculate the cumulative delay time from the first sent out requests.
-    for i in range(1, len(delay_ts)):
-        delay_ts[i] += delay_ts[i - 1]
-    if ramp_up_strategy is None and delay_ts[-1] != 0:
-        # When ramp_up_strategy is not set, we assume the request rate is fixed
-        # and all requests should be sent in target_total_delay_s, the following
-        # logic would re-scale delay time to ensure the final delay_ts
-        # align with target_total_delay_s.
-        #
-        # NOTE: If we simply accumulate the random delta values
-        # from the gamma distribution, their sum would have 1-2% gap
-        # from target_total_delay_s. The purpose of the following logic is to
-        # close the gap for stabilizing the throughput data
-        # from different random seeds.
-        target_total_delay_s = total_requests / request_rate
-        normalize_factor = target_total_delay_s / delay_ts[-1]
-        delay_ts = [delay * normalize_factor for delay in delay_ts]
+        # Calculate the cumulative delay time from the first sent out requests.
+        for i in range(1, len(delay_ts)):
+            delay_ts[i] += delay_ts[i - 1]
+        if ramp_up_strategy is None and delay_ts[-1] != 0:
+            # When ramp_up_strategy is not set, we assume the request rate is
+            # fixed and all requests should be sent in target_total_delay_s.
+            target_total_delay_s = total_requests / request_rate
+            normalize_factor = target_total_delay_s / delay_ts[-1]
+            delay_ts = [delay * normalize_factor for delay in delay_ts]
 
     start_ts = time.time()
     for request_index, request in enumerate(input_requests):
@@ -627,6 +984,11 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    system_metrics_interval_s: float = 0.1,
+    system_metrics_output_path: str | None = None,
+    per_second_system_output_path: str | None = None,
+    per_second_latency_output_path: str | None = None,
+    save_generated_trace_path: str | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -755,9 +1117,14 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
+    has_arrival_timestamps = all(
+        req.arrival_time_s is not None for req in input_requests
+    )
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
-    if ramp_up_strategy is not None:
+    if has_arrival_timestamps:
+        print("Traffic mode: replay dataset-provided request timestamps.")
+    elif ramp_up_strategy is not None:
         print(f"Traffic ramp-up strategy: {ramp_up_strategy}.")
         print(
             f"Will increase RPS from {ramp_up_start_rps} to "
@@ -766,7 +1133,8 @@ async def benchmark(
     else:
         print(f"Traffic request rate: {request_rate}")
 
-    print(f"Burstiness factor: {burstiness} ({distribution})")
+    if not has_arrival_timestamps:
+        print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
@@ -787,6 +1155,19 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    generated_trace_rows: list[dict[str, Any]] = []
+
+    system_metrics_stop_event = asyncio.Event()
+    system_metrics_task = asyncio.create_task(
+        collect_system_metrics(
+            base_url=base_url,
+            session=session,
+            interval_s=system_metrics_interval_s,
+            stop_event=system_metrics_stop_event,
+            benchmark_start_time=benchmark_start_time,
+            output_json_path=system_metrics_output_path,
+        )
+    )
 
     rps_change_events = []
     last_int_rps = -1
@@ -821,6 +1202,25 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        request_created_at_perf = time.perf_counter()
+        request_created_at_epoch = time.time()
+
+        if save_generated_trace_path is not None:
+            generated_trace_rows.append(
+                {
+                    "request_index": len(generated_trace_rows),
+                    "request_id": request_id,
+                    "dataset_arrival_time_s": request.arrival_time_s,
+                    "request_created_at_epoch_s": request_created_at_epoch,
+                    "request_created_at_perf_s": request_created_at_perf,
+                    "request_created_after_benchmark_start_s": max(
+                        request_created_at_perf - benchmark_start_time, 0.0
+                    ),
+                    "prompt_len": prompt_len,
+                    "expected_output_len": output_len,
+                }
+            )
+
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -839,6 +1239,7 @@ async def benchmark(
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
+            request_created_at=request_created_at_perf,
         )
         tasks.append(
             asyncio.create_task(
@@ -848,6 +1249,20 @@ async def benchmark(
             )
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    system_metrics_stop_event.set()
+    system_metrics_samples = await system_metrics_task
+    per_second_system_metrics, queue_depth_summary = compute_per_second_system_metrics(
+        system_metrics_samples
+    )
+
+    if per_second_system_output_path is not None:
+        os.makedirs(os.path.dirname(per_second_system_output_path) or ".", exist_ok=True)
+        with open(per_second_system_output_path, "w", encoding="utf-8") as f:
+            json.dump(per_second_system_metrics, f)
+
+    if save_generated_trace_path is not None:
+        save_generated_trace(save_generated_trace_path, generated_trace_rows)
 
     if pbar is not None:
         pbar.close()
@@ -965,6 +1380,34 @@ async def benchmark(
                 "Total token throughput (tok/s):", metrics.total_token_throughput
             )
         )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Avg batch size (running requests):",
+            queue_depth_summary["avg_batch_size"],
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Avg queue depth (running+waiting):",
+            queue_depth_summary["avg_queue_depth"],
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Avg running requests:", queue_depth_summary["avg_running"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Avg waiting requests:", queue_depth_summary["avg_waiting"]
+        )
+    )
+
+    per_second_ttft_tbt = compute_per_second_ttft_tbt(outputs, benchmark_start_time)
+    if per_second_latency_output_path is not None:
+        os.makedirs(os.path.dirname(per_second_latency_output_path) or ".", exist_ok=True)
+        with open(per_second_latency_output_path, "w", encoding="utf-8") as f:
+            json.dump(per_second_ttft_tbt, f)
 
     if isinstance(metrics, BenchmarkMetrics):
         result = {
@@ -981,12 +1424,21 @@ async def benchmark(
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
+            "request_created_times": [output.request_created_at for output in outputs],
             "start_times": [output.start_time for output in outputs],
+            "first_token_timestamps": [
+                output.first_token_timestamp for output in outputs
+            ],
+            "token_timestamps": [output.token_timestamps for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
+            "per_second_ttft_tbt": per_second_ttft_tbt,
+            "per_second_system_metrics": per_second_system_metrics,
+            "queue_depth_summary": queue_depth_summary,
+            "system_metrics_samples": system_metrics_samples,
         }
     else:
         result = {
@@ -997,6 +1449,10 @@ async def benchmark(
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
+            "per_second_ttft_tbt": per_second_ttft_tbt,
+            "per_second_system_metrics": per_second_system_metrics,
+            "queue_depth_summary": queue_depth_summary,
+            "system_metrics_samples": system_metrics_samples,
         }
 
     if rps_change_events:
@@ -1341,6 +1797,36 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "information such as response, error, ttfts, tpots, etc.",
     )
     parser.add_argument(
+        "--system-metrics-interval-s",
+        type=float,
+        default=0.1,
+        help="Sampling interval in seconds for polling server /metrics during the benchmark.",
+    )
+    parser.add_argument(
+        "--system-metrics-output",
+        type=str,
+        default=None,
+        help="Optional path to write polled system metrics as JSONL (one sample per line).",
+    )
+    parser.add_argument(
+        "--per-second-system-output",
+        type=str,
+        default=None,
+        help="Optional path to write per-second system throughput and queue depth aggregates in JSON format.",
+    )
+    parser.add_argument(
+        "--per-second-latency-output",
+        type=str,
+        default=None,
+        help="Optional path to write per-second TTFT/TBT aggregates in JSON format.",
+    )
+    parser.add_argument(
+        "--save-generated-trace",
+        type=str,
+        default=None,
+        help="Optional CSV path to save the benchmark-generated request trace with creation timestamps.",
+    )
+    parser.add_argument(
         "--append-result",
         action="store_true",
         help="Append the benchmark result to the existing json file.",
@@ -1545,6 +2031,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    if args.system_metrics_interval_s <= 0:
+        raise ValueError("--system-metrics-interval-s must be positive")
+
     # Validate ramp-up arguments
     if args.ramp_up_strategy is not None:
         if args.request_rate != float("inf"):
@@ -1629,11 +2118,13 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if args.input_len is not None:
         args.random_input_len = args.input_len
         args.sonnet_input_len = args.input_len
+        args.servegen_input_len = args.input_len
 
     if args.output_len is not None:
         args.random_output_len = args.output_len
         args.sonnet_output_len = args.output_len
         args.sharegpt_output_len = args.output_len
+        args.servegen_output_len = args.output_len
         args.custom_output_len = args.output_len
         args.hf_output_len = args.output_len
         args.spec_bench_output_len = args.output_len
@@ -1649,6 +2140,24 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Load the dataset.
     input_requests = get_samples(args, tokenizer)
+
+    has_arrival_timestamps = any(
+        req.arrival_time_s is not None for req in input_requests
+    )
+    if has_arrival_timestamps and args.ramp_up_strategy is not None:
+        raise ValueError(
+            "Dataset-provided timestamps are incompatible with --ramp-up-"
+            "strategy. Please disable ramp-up when replaying trace timings."
+        )
+
+    if has_arrival_timestamps and (
+        args.request_rate != float("inf") or args.burstiness != 1.0
+    ):
+        print(
+            "Dataset timestamps detected; ignoring --request-rate and "
+            "--burstiness and replaying request timing from the dataset."
+        )
+
     goodput_config_dict = check_goodput_args(args)
 
     backend = args.backend
@@ -1729,6 +2238,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
+        system_metrics_interval_s=args.system_metrics_interval_s,
+        system_metrics_output_path=args.system_metrics_output,
+        per_second_system_output_path=args.per_second_system_output,
+        per_second_latency_output_path=args.per_second_latency_output,
+        save_generated_trace_path=args.save_generated_trace,
     )
 
     # Save config and results to json
@@ -1775,11 +2289,15 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         for field in [
             "input_lens",
             "output_lens",
+            "request_created_times",
             "start_times",
+            "first_token_timestamps",
+            "token_timestamps",
             "ttfts",
             "itls",
             "generated_texts",
             "errors",
+            "system_metrics_samples",
         ]:
             if field in result_json:
                 del result_json[field]

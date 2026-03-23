@@ -77,6 +77,7 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
+    request_created_at: float | None = None
 
 
 @dataclass
@@ -92,7 +93,10 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    request_created_at: float = 0.0
     start_time: float = 0.0
+    first_token_timestamp: float = 0.0
+    token_timestamps: list[float] = field(default_factory=list)
     input_audio_duration: float = 0.0  # in seconds
 
 
@@ -186,6 +190,7 @@ async def async_request_openai_completions(
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
+    output.request_created_at = request_func_input.request_created_at or 0.0
 
     generated_text = ""
     st = time.perf_counter()
@@ -228,10 +233,13 @@ async def async_request_openai_completions(
                                     first_chunk_received = True
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    output.first_token_timestamp = timestamp
+                                    output.token_timestamps.append(timestamp)
 
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
+                                    output.token_timestamps.append(timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
@@ -315,6 +323,7 @@ async def async_request_openai_chat_completions(
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
+    output.request_created_at = request_func_input.request_created_at or 0.0
 
     generated_text = ""
     ttft = 0.0
@@ -350,10 +359,13 @@ async def async_request_openai_chat_completions(
                                 if ttft == 0.0:
                                     ttft = timestamp - st
                                     output.ttft = ttft
+                                    output.first_token_timestamp = timestamp
+                                    output.token_timestamps.append(timestamp)
 
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
+                                    output.token_timestamps.append(timestamp)
 
                                 generated_text += content or ""
                             elif usage := data.get("usage"):
@@ -423,6 +435,7 @@ async def async_request_openai_audio(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.request_created_at = request_func_input.request_created_at or 0.0
         output.input_audio_duration = soundfile.info(f).duration
         f.seek(0)
 
@@ -458,12 +471,15 @@ async def async_request_openai_audio(
                                     if ttft == 0.0:
                                         ttft = timestamp - st
                                         output.ttft = ttft
+                                        output.first_token_timestamp = timestamp
+                                        output.token_timestamps.append(timestamp)
 
                                     # Decoding phase
                                     else:
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
+                                        output.token_timestamps.append(timestamp)
 
                                     generated_text += content or ""
                                 elif usage := data.get("usage"):
@@ -494,9 +510,11 @@ async def _run_pooling_request(
     api_url: str,
     payload: dict[str, Any],
     headers: dict[str, Any],
+    request_created_at: float | None = None,
     pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
+    output.request_created_at = request_created_at or 0.0
     st = time.perf_counter()
     output.start_time = st
     try:
@@ -553,6 +571,7 @@ async def async_request_openai_embeddings(
         api_url,
         payload=payload,
         headers=headers,
+        request_created_at=request_func_input.request_created_at,
         pbar=pbar,
     )
 
@@ -589,6 +608,7 @@ async def async_request_vllm_rerank(
         api_url,
         payload=payload,
         headers=headers,
+        request_created_at=request_func_input.request_created_at,
         pbar=pbar,
     )
 
@@ -625,6 +645,7 @@ async def async_request_openai_embeddings_chat(
         api_url,
         payload=payload,
         headers=headers,
+        request_created_at=request_func_input.request_created_at,
         pbar=pbar,
     )
 
