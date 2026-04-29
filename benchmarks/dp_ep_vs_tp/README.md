@@ -26,7 +26,7 @@ From the repo root, after setting up the vLLM environment:
 ```bash
 MODEL=deepseek-ai/DeepSeek-V2-Lite \
 SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
-benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.sh
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
 ```
 
 The script creates a timestamped result directory under:
@@ -61,6 +61,7 @@ BASE_PORT=8100
 HOST=127.0.0.1
 SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16"
 BENCH_EXTRA_ARGS="--ignore-eos"
+PYTHON_BIN=.venv/bin/python
 ```
 
 Use `REQUEST_RATE=inf` for saturation-style throughput. Use finite request
