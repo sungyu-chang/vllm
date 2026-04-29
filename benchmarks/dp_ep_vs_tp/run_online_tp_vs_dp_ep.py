@@ -30,12 +30,99 @@ def env_list(name: str, default: str) -> list[int]:
         raise SystemExit(f"{name} must be a space-separated list of integers") from exc
 
 
+def parse_cuda_visible_devices() -> list[str] | None:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None or raw.strip() in ("", "-1", "NoDevFiles"):
+        return None
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def detect_gpu_ids() -> list[str]:
+    visible_ids = parse_cuda_visible_devices()
+    if "GPU_COUNT" in os.environ:
+        try:
+            count = int(os.environ["GPU_COUNT"])
+        except ValueError as exc:
+            raise SystemExit("GPU_COUNT must be an integer") from exc
+        if count < 1:
+            raise SystemExit("GPU_COUNT must be >= 1")
+        if visible_ids is not None:
+            if count > len(visible_ids):
+                raise SystemExit(
+                    "GPU_COUNT exceeds CUDA_VISIBLE_DEVICES length: "
+                    f"{count} > {len(visible_ids)}"
+                )
+            return visible_ids[:count]
+        return [str(index) for index in range(count)]
+
+    if visible_ids is not None:
+        return visible_ids
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        raise SystemExit(
+            "Unable to detect GPU count: set GPU_COUNT or install nvidia-smi."
+        )
+
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "-L"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            "Unable to detect GPU count from nvidia-smi; set GPU_COUNT."
+        ) from exc
+
+    count = sum(1 for line in result.stdout.splitlines() if line.startswith("GPU "))
+    if count < 1:
+        raise SystemExit("No GPUs detected; set GPU_COUNT to override.")
+    return [str(index) for index in range(count)]
+
+
+def default_tp_sizes(gpu_count: int) -> list[int]:
+    sizes: list[int] = []
+    size = 1
+    while size <= gpu_count:
+        sizes.append(size)
+        size *= 2
+    return sizes
+
+
+def default_dp_sizes(gpu_count: int) -> list[int]:
+    return list(range(1, gpu_count + 1))
+
+
+def configured_sizes(name: str, default_sizes: list[int]) -> list[int]:
+    if name in os.environ:
+        return env_list(name, "")
+    return default_sizes
+
+
+def validate_sizes(name: str, sizes: list[int], gpu_count: int) -> None:
+    if not sizes:
+        raise SystemExit(f"{name} must not be empty")
+    invalid = [size for size in sizes if size < 1 or size > gpu_count]
+    if invalid:
+        raise SystemExit(
+            f"{name} contains sizes outside available GPU count "
+            f"{gpu_count}: {invalid}"
+        )
+
+
 MODEL = env("MODEL", "deepseek-ai/DeepSeek-V2-Lite")
 SERVED_MODEL_NAME = env("SERVED_MODEL_NAME", "bench-model")
 HOST = env("HOST", "127.0.0.1")
 BASE_PORT = int(env("BASE_PORT", "8100"))
-TP_SIZES = env_list("TP_SIZES", "2 4 8")
-DP_SIZES = env_list("DP_SIZES", "1 2 3 4 5 6 7 8")
+GPU_IDS = detect_gpu_ids()
+GPU_COUNT = len(GPU_IDS)
+TP_SIZES = configured_sizes("TP_SIZES", default_tp_sizes(GPU_COUNT))
+DP_SIZES = configured_sizes("DP_SIZES", default_dp_sizes(GPU_COUNT))
+validate_sizes("TP_SIZES", TP_SIZES, GPU_COUNT)
+validate_sizes("DP_SIZES", DP_SIZES, GPU_COUNT)
 NUM_PROMPTS = env("NUM_PROMPTS", "1000")
 INPUT_LEN = env("INPUT_LEN", "1024")
 OUTPUT_LEN = env("OUTPUT_LEN", "128")
@@ -69,7 +156,7 @@ def require_command(command: str) -> None:
 
 
 def gpu_list(count: int) -> str:
-    return ",".join(str(i) for i in range(count))
+    return ",".join(GPU_IDS[:count])
 
 
 def cleanup_server() -> None:
@@ -235,6 +322,11 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, handle_signal)
     try:
+        print(
+            "Detected benchmark matrix: "
+            f"GPU_IDS={GPU_IDS}, TP_SIZES={TP_SIZES}, DP_SIZES={DP_SIZES}",
+            flush=True,
+        )
         case_index = 0
         for tp_size in TP_SIZES:
             run_case(
