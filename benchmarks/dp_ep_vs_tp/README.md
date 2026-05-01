@@ -32,6 +32,20 @@ SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
 ```
 
+For a two-node Ray cluster with one GPU per node, compare `TP=1 x 2` against
+`DP=2 + EP` from the Ray head node:
+
+```bash
+MODEL=allenai/OLMoE-1B-7B-0924-Instruct \
+SERVER_EXTRA_ARGS="--dtype float16" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py
+```
+
+The `tp1x2` case is one Ray-DP vLLM deployment with `DP=2`, `TP=1`, and EP
+disabled. For MoE models, vLLM's default behavior shards MoE expert layers as
+tensor parallel over `DP x TP`; this is not the same as two fully independent
+HTTP servers behind an external load balancer.
+
 The script creates a timestamped result directory under:
 
 ```text
@@ -66,6 +80,7 @@ HOST=127.0.0.1
 SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16"
 BENCH_EXTRA_ARGS="--ignore-eos"
 PYTHON_BIN=.venv/bin/python
+VLLM_RAY_DP_PACK_STRATEGY=span
 ```
 
 `GPU_COUNT` is optional. If it is unset, the script first honors
@@ -73,6 +88,9 @@ PYTHON_BIN=.venv/bin/python
 `CUDA_VISIBLE_DEVICES` and `GPU_COUNT` are set, the script uses the first
 `GPU_COUNT` entries from `CUDA_VISIBLE_DEVICES`. Explicit `TP_SIZES` and
 `DP_SIZES` override the detected defaults.
+
+For the two-node Ray script, `VLLM_RAY_DP_PACK_STRATEGY` defaults to `span` so
+Ray spreads the two DP ranks across the two one-GPU nodes.
 
 Use `REQUEST_RATE=inf` for saturation-style throughput. Use finite request
 rates plus `MAX_CONCURRENCY` to study latency/throughput tradeoffs.
