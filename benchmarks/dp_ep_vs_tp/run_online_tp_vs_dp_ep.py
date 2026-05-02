@@ -9,13 +9,19 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarks.dp_ep_vs_tp.results_layout import build_result_root, write_run_readme
 
 
 def env(name: str, default: str) -> str:
@@ -130,16 +136,14 @@ REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
 MAX_MODEL_LEN = env("MAX_MODEL_LEN", "4096")
 ALL2ALL_BACKEND = env("ALL2ALL_BACKEND", "allgather_reducescatter")
-RESULT_ROOT = Path(
-    env(
-        "RESULT_ROOT",
-        f"benchmarks/dp_ep_vs_tp/results/{datetime.now():%Y%m%d_%H%M%S}",
-    )
-)
+RESULT_ROOT = build_result_root("dp_ep_vs_tp", "one_node_online")
 SERVER_START_TIMEOUT = int(env("SERVER_START_TIMEOUT", "900"))
+PORT_RELEASE_TIMEOUT = int(env("PORT_RELEASE_TIMEOUT", "60"))
 SERVER_EXTRA_ARGS = shlex.split(env("SERVER_EXTRA_ARGS", ""))
 BENCH_EXTRA_ARGS = shlex.split(env("BENCH_EXTRA_ARGS", ""))
 PYTHON_BIN = env("PYTHON_BIN", sys.executable)
+RUN_NOTES = env("RUN_NOTES", "")
+FIX_NOTES = env("FIX_NOTES", "")
 
 SERVER_LOG_DIR = RESULT_ROOT / "server_logs"
 BENCH_LOG_DIR = RESULT_ROOT / "bench_logs"
@@ -172,6 +176,24 @@ def cleanup_server() -> None:
             proc.kill()
             proc.wait(timeout=30)
     server_proc = None
+
+
+def is_port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((HOST, port)) == 0
+
+
+def wait_for_port_to_close(port: int) -> None:
+    deadline = time.monotonic() + PORT_RELEASE_TIMEOUT
+    while time.monotonic() < deadline:
+        if not is_port_open(port):
+            return
+        time.sleep(1)
+    raise TimeoutError(
+        f"Timed out waiting for port {port} on {HOST} to close. "
+        "A stale API server may still be running."
+    )
 
 
 def handle_signal(_signum: int, _frame: object) -> None:
@@ -215,6 +237,7 @@ def run_case(
 
     print(f"=== {case_name} on GPUs {cuda_devices} port {port} ===", flush=True)
     cleanup_server()
+    wait_for_port_to_close(port)
 
     server_cmd = [
         "vllm",
@@ -249,7 +272,11 @@ def run_case(
         "--backend",
         "openai",
         "--model",
+        MODEL,
+        "--served-model-name",
         SERVED_MODEL_NAME,
+        "--tokenizer",
+        MODEL,
         "--host",
         HOST,
         "--port",
@@ -314,11 +341,61 @@ def summarize_results() -> None:
     print(f"Summary: {summary_path}")
 
 
+def write_run_summary(*, status: str, started_at: str,
+                      completed_at: str | None = None,
+                      failure_reason: str | None = None) -> None:
+    planned_cases = [f"tp{size}" for size in TP_SIZES]
+    planned_cases.extend(f"dp{size}_ep" for size in DP_SIZES)
+    write_run_readme(
+        RESULT_ROOT,
+        title="One-node TP vs DP+EP Run",
+        script_path="benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py",
+        status=status,
+        started_at=started_at,
+        completed_at=completed_at,
+        setup={
+            "model": MODEL,
+            "served_model_name": SERVED_MODEL_NAME,
+            "host": HOST,
+            "base_port": str(BASE_PORT),
+            "gpu_ids": ",".join(GPU_IDS),
+            "gpu_count": str(GPU_COUNT),
+            "tp_sizes": " ".join(str(size) for size in TP_SIZES),
+            "dp_sizes": " ".join(str(size) for size in DP_SIZES),
+            "num_prompts": NUM_PROMPTS,
+            "input_len": INPUT_LEN,
+            "output_len": OUTPUT_LEN,
+            "request_rate": REQUEST_RATE,
+            "max_concurrency": MAX_CONCURRENCY or "unset",
+            "max_model_len": MAX_MODEL_LEN,
+            "all2all_backend": ALL2ALL_BACKEND,
+            "server_start_timeout": str(SERVER_START_TIMEOUT),
+            "port_release_timeout": str(PORT_RELEASE_TIMEOUT),
+            "server_extra_args": " ".join(SERVER_EXTRA_ARGS) or "(none)",
+            "bench_extra_args": " ".join(BENCH_EXTRA_ARGS) or "(none)",
+            "python_bin": PYTHON_BIN,
+            "smoke_run": str(RESULT_ROOT.name.endswith("_smoke")).lower(),
+        },
+        planned_cases=planned_cases,
+        artifact_paths={
+            "server logs": "server_logs/",
+            "bench logs": "bench_logs/",
+            "json results": "json/",
+            "summary": "summary.csv",
+        },
+        failure_reason=failure_reason,
+        run_notes=RUN_NOTES,
+        fix_notes=FIX_NOTES,
+    )
+
+
 def main() -> int:
     require_command("vllm")
     SERVER_LOG_DIR.mkdir(parents=True, exist_ok=True)
     BENCH_LOG_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().isoformat(timespec="seconds")
+    write_run_summary(status="running", started_at=started_at)
 
     signal.signal(signal.SIGTERM, handle_signal)
     try:
@@ -355,8 +432,21 @@ def main() -> int:
             case_index += 1
 
         summarize_results()
+        write_run_summary(
+            status="completed",
+            started_at=started_at,
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
         print(f"Results: {RESULT_ROOT}")
         return 0
+    except Exception:
+        write_run_summary(
+            status="failed",
+            started_at=started_at,
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            failure_reason=traceback.format_exc(),
+        )
+        raise
     finally:
         cleanup_server()
 

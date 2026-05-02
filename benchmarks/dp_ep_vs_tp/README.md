@@ -36,6 +36,7 @@ For a two-node Ray cluster with one GPU per node, compare `TP=1 x 2` against
 `DP=2 + EP` from the Ray head node:
 
 ```bash
+VLLM_RAY_DP_PACK_STRATEGY=strict \
 MODEL=allenai/OLMoE-1B-7B-0924-Instruct \
 SERVER_EXTRA_ARGS="--dtype float16" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py
@@ -49,7 +50,8 @@ HTTP servers behind an external load balancer.
 The script creates a timestamped result directory under:
 
 ```text
-benchmarks/dp_ep_vs_tp/results/
+results/dp_ep_vs_tp/one_node_online/
+results/dp_ep_vs_tp/two_node_ray/
 ```
 
 Each case gets:
@@ -58,6 +60,11 @@ Each case gets:
 - `bench_logs/<case>.log`
 - `json/<case>.json`
 - `summary.csv`
+- `README.md`
+
+Every run directory now includes a `README.md` with the experiment setup,
+planned cases, artifact locations, run notes, fix notes, and failure details if
+the run aborts.
 
 ## Common Knobs
 
@@ -81,6 +88,9 @@ SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16"
 BENCH_EXTRA_ARGS="--ignore-eos"
 PYTHON_BIN=.venv/bin/python
 VLLM_RAY_DP_PACK_STRATEGY=span
+SMOKE_RUN=0
+RUN_NOTES=
+FIX_NOTES=
 ```
 
 `GPU_COUNT` is optional. If it is unset, the script first honors
@@ -89,8 +99,15 @@ VLLM_RAY_DP_PACK_STRATEGY=span
 `GPU_COUNT` entries from `CUDA_VISIBLE_DEVICES`. Explicit `TP_SIZES` and
 `DP_SIZES` override the detected defaults.
 
-For the two-node Ray script, `VLLM_RAY_DP_PACK_STRATEGY` defaults to `span` so
-Ray spreads the two DP ranks across the two one-GPU nodes.
+For the two-node Ray script, `VLLM_RAY_DP_PACK_STRATEGY` defaults to `strict`.
+On the current DP placement logic, a two-node one-GPU-per-node cluster cannot
+use `span`; use `strict` for this topology.
+
+Set `SMOKE_RUN=1` to suffix the run folder name with `_smoke`.
+
+Use `RUN_NOTES` to record experiment-specific context in the per-run
+`README.md`, and `FIX_NOTES` to record what changed when rerunning after a
+failure.
 
 Use `REQUEST_RATE=inf` for saturation-style throughput. Use finite request
 rates plus `MAX_CONCURRENCY` to study latency/throughput tradeoffs.

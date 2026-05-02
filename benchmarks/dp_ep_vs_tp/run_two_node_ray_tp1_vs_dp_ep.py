@@ -13,13 +13,19 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarks.dp_ep_vs_tp.results_layout import build_result_root, write_run_readme
 
 
 def env(name: str, default: str) -> str:
@@ -37,17 +43,17 @@ REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
 MAX_MODEL_LEN = env("MAX_MODEL_LEN", "4096")
 ALL2ALL_BACKEND = env("ALL2ALL_BACKEND", "allgather_reducescatter")
-RESULT_ROOT = Path(
-    env(
-        "RESULT_ROOT",
-        f"benchmarks/dp_ep_vs_tp/results/two_node_ray_{datetime.now():%Y%m%d_%H%M%S}",
-    )
-)
+RESULT_ROOT = build_result_root("dp_ep_vs_tp", "two_node_ray")
 SERVER_START_TIMEOUT = int(env("SERVER_START_TIMEOUT", "900"))
+SERVER_START_RETRIES = int(env("SERVER_START_RETRIES", "3"))
+SERVER_RETRY_DELAY_SECONDS = int(env("SERVER_RETRY_DELAY_SECONDS", "10"))
+PORT_RELEASE_TIMEOUT = int(env("PORT_RELEASE_TIMEOUT", "60"))
 SERVER_EXTRA_ARGS = shlex.split(env("SERVER_EXTRA_ARGS", "--dtype float16"))
 BENCH_EXTRA_ARGS = shlex.split(env("BENCH_EXTRA_ARGS", ""))
 PYTHON_BIN = env("PYTHON_BIN", sys.executable)
-RAY_DP_PACK_STRATEGY = env("VLLM_RAY_DP_PACK_STRATEGY", "span")
+RAY_DP_PACK_STRATEGY = env("VLLM_RAY_DP_PACK_STRATEGY", "strict")
+RUN_NOTES = env("RUN_NOTES", "")
+FIX_NOTES = env("FIX_NOTES", "")
 
 SERVER_LOG_DIR = RESULT_ROOT / "server_logs"
 BENCH_LOG_DIR = RESULT_ROOT / "bench_logs"
@@ -78,6 +84,24 @@ def cleanup_server() -> None:
     server_proc = None
 
 
+def is_port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((HOST, port)) == 0
+
+
+def wait_for_port_to_close(port: int) -> None:
+    deadline = time.monotonic() + PORT_RELEASE_TIMEOUT
+    while time.monotonic() < deadline:
+        if not is_port_open(port):
+            return
+        time.sleep(1)
+    raise TimeoutError(
+        f"Timed out waiting for port {port} on {HOST} to close. "
+        "A stale API server may still be running."
+    )
+
+
 def handle_signal(_signum: int, _frame: object) -> None:
     cleanup_server()
     raise SystemExit(128 + int(signal.SIGTERM))
@@ -104,6 +128,13 @@ def wait_for_server(port: int, log_file: Path) -> None:
     )
 
 
+def should_retry_server_start(log_file: Path) -> bool:
+    if not log_file.is_file():
+        return False
+    log_text = log_file.read_text(encoding="utf-8", errors="replace")
+    return "AssertionError: No GPU found in Ray cluster." in log_text
+
+
 def run_case(case_name: str, port: int, server_args: list[str]) -> None:
     global server_proc
 
@@ -113,6 +144,7 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
 
     print(f"=== {case_name} on Ray DP=2 port {port} ===", flush=True)
     cleanup_server()
+    wait_for_port_to_close(port)
 
     server_cmd = [
         "vllm",
@@ -141,15 +173,37 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         **os.environ,
         "VLLM_RAY_DP_PACK_STRATEGY": RAY_DP_PACK_STRATEGY,
     }
-    with server_log.open("wb") as log:
-        server_proc = subprocess.Popen(
-            server_cmd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=server_env,
-        )
+    last_error: Exception | None = None
+    for attempt in range(1, SERVER_START_RETRIES + 1):
+        with server_log.open("wb") as log:
+            server_proc = subprocess.Popen(
+                server_cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=server_env,
+            )
 
-    wait_for_server(port, server_log)
+        try:
+            wait_for_server(port, server_log)
+            break
+        except RuntimeError as exc:
+            last_error = exc
+            cleanup_server()
+            wait_for_port_to_close(port)
+            if attempt == SERVER_START_RETRIES or not should_retry_server_start(
+                server_log
+            ):
+                raise
+            print(
+                f"Server startup hit transient Ray GPU discovery failure on attempt "
+                f"{attempt}/{SERVER_START_RETRIES}; retrying in "
+                f"{SERVER_RETRY_DELAY_SECONDS}s.",
+                flush=True,
+            )
+            time.sleep(SERVER_RETRY_DELAY_SECONDS)
+    else:
+        if last_error is not None:
+            raise last_error
 
     bench_cmd = [
         "vllm",
@@ -158,7 +212,11 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         "--backend",
         "openai",
         "--model",
+        MODEL,
+        "--served-model-name",
         SERVED_MODEL_NAME,
+        "--tokenizer",
+        MODEL,
         "--host",
         HOST,
         "--port",
@@ -225,11 +283,58 @@ def summarize_results() -> None:
     print(f"Summary: {summary_path}")
 
 
+def write_run_summary(*, status: str, started_at: str,
+                      completed_at: str | None = None,
+                      failure_reason: str | None = None) -> None:
+    write_run_readme(
+        RESULT_ROOT,
+        title="Two-node Ray TP1x2 vs DP+EP Run",
+        script_path="benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py",
+        status=status,
+        started_at=started_at,
+        completed_at=completed_at,
+        setup={
+            "model": MODEL,
+            "served_model_name": SERVED_MODEL_NAME,
+            "host": HOST,
+            "base_port": str(BASE_PORT),
+            "num_prompts": NUM_PROMPTS,
+            "input_len": INPUT_LEN,
+            "output_len": OUTPUT_LEN,
+            "request_rate": REQUEST_RATE,
+            "max_concurrency": MAX_CONCURRENCY or "unset",
+            "max_model_len": MAX_MODEL_LEN,
+            "all2all_backend": ALL2ALL_BACKEND,
+            "server_start_timeout": str(SERVER_START_TIMEOUT),
+            "server_start_retries": str(SERVER_START_RETRIES),
+            "server_retry_delay_seconds": str(SERVER_RETRY_DELAY_SECONDS),
+            "port_release_timeout": str(PORT_RELEASE_TIMEOUT),
+            "server_extra_args": " ".join(SERVER_EXTRA_ARGS) or "(none)",
+            "bench_extra_args": " ".join(BENCH_EXTRA_ARGS) or "(none)",
+            "python_bin": PYTHON_BIN,
+            "ray_dp_pack_strategy": RAY_DP_PACK_STRATEGY,
+            "smoke_run": str(RESULT_ROOT.name.endswith("_smoke")).lower(),
+        },
+        planned_cases=["tp1x2", "dp2_ep"],
+        artifact_paths={
+            "server logs": "server_logs/",
+            "bench logs": "bench_logs/",
+            "json results": "json/",
+            "summary": "summary.csv",
+        },
+        failure_reason=failure_reason,
+        run_notes=RUN_NOTES,
+        fix_notes=FIX_NOTES,
+    )
+
+
 def main() -> int:
     require_command("vllm")
     SERVER_LOG_DIR.mkdir(parents=True, exist_ok=True)
     BENCH_LOG_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().isoformat(timespec="seconds")
+    write_run_summary(status="running", started_at=started_at)
 
     signal.signal(signal.SIGTERM, handle_signal)
     try:
@@ -254,8 +359,21 @@ def main() -> int:
             ],
         )
         summarize_results()
+        write_run_summary(
+            status="completed",
+            started_at=started_at,
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
         print(f"Results: {RESULT_ROOT}")
         return 0
+    except Exception:
+        write_run_summary(
+            status="failed",
+            started_at=started_at,
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            failure_reason=traceback.format_exc(),
+        )
+        raise
     finally:
         cleanup_server()
 
