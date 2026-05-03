@@ -41,7 +41,7 @@ INPUT_LEN = env("INPUT_LEN", "1024")
 OUTPUT_LEN = env("OUTPUT_LEN", "128")
 REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
-MAX_MODEL_LEN = env("MAX_MODEL_LEN", "4096")
+MAX_MODEL_LEN = env("MAX_MODEL_LEN", "")
 ALL2ALL_BACKEND = env("ALL2ALL_BACKEND", "allgather_reducescatter")
 RESULT_ROOT = build_result_root("dp_ep_vs_tp", "two_node_ray")
 SERVER_START_TIMEOUT = int(env("SERVER_START_TIMEOUT", "900"))
@@ -156,8 +156,6 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         HOST,
         "--port",
         str(port),
-        "--max-model-len",
-        MAX_MODEL_LEN,
         "--tensor-parallel-size",
         "1",
         "--data-parallel-size",
@@ -169,6 +167,8 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         *server_args,
         *SERVER_EXTRA_ARGS,
     ]
+    if MAX_MODEL_LEN:
+        server_cmd.extend(["--max-model-len", MAX_MODEL_LEN])
     server_env = {
         **os.environ,
         "VLLM_RAY_DP_PACK_STRATEGY": RAY_DP_PACK_STRATEGY,
@@ -303,7 +303,7 @@ def write_run_summary(*, status: str, started_at: str,
             "output_len": OUTPUT_LEN,
             "request_rate": REQUEST_RATE,
             "max_concurrency": MAX_CONCURRENCY or "unset",
-            "max_model_len": MAX_MODEL_LEN,
+            "max_model_len": MAX_MODEL_LEN or "vLLM default",
             "all2all_backend": ALL2ALL_BACKEND,
             "server_start_timeout": str(SERVER_START_TIMEOUT),
             "server_start_retries": str(SERVER_START_RETRIES),

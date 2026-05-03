@@ -4,7 +4,7 @@
 This script consumes one or more run directories produced by
 benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py, writes a compact combined CSV,
 emits a Markdown summary comparing TP and DP+EP at each GPU count, and renders
-an SVG figure of total token throughput vs GPU count.
+a PNG figure of total token throughput vs GPU count.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Output directory for combined CSV, Markdown summary, and SVG. "
+            "Output directory for combined CSV, Markdown summary, and PNG. "
             "Defaults to results/dp_ep_vs_tp/analysis/<timestamp>."
         ),
     )
@@ -212,12 +212,12 @@ def main() -> None:
 
     write_combined_csv(output_dir / "combined_summary.csv", rows)
     write_markdown_summary(output_dir / "analysis.md", rows)
-    render_plot(run_dirs, output_dir / "total_token_throughput.svg", args.title)
+    render_plot(run_dirs, output_dir / "total_token_throughput.png", args.title)
 
     print(f"Analysis directory: {output_dir}")
     print(f"Combined CSV: {output_dir / 'combined_summary.csv'}")
     print(f"Markdown summary: {output_dir / 'analysis.md'}")
-    print(f"Figure: {output_dir / 'total_token_throughput.svg'}")
+    print(f"Figure: {output_dir / 'total_token_throughput.png'}")
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ For the expanded one-node sweep requested for Qwen MoE models with
 `TP_SIZES="1 2 4 8"`, `DP_SIZES="1 2 3 4 5 6 7 8"`, `input_len=128`,
 `output_len=256`, and `num_prompts=5000`, use the suite wrapper. It runs the
 Qwen1.5 MoE and Qwen3 MoE 30B experiments as separate run directories and then
-generates a combined CSV, Markdown summary, and SVG figure without manual
+generates a combined CSV, Markdown summary, and PNG figure without manual
 polling:
 
 ```bash
@@ -117,6 +117,13 @@ Each case gets:
 Every run directory now includes a `README.md` with the experiment setup,
 planned cases, artifact locations, run notes, fix notes, and failure details if
 the run aborts.
+
+Figure generation uses matplotlib and writes PNG files. Install the benchmark
+extra before running plot-producing scripts:
+
+```bash
+uv pip install -e ".[bench]"
+```
 
 ## Module Timing Profile
 
@@ -184,26 +191,26 @@ just qwen3-moe-ep-pipeline
 ```
 
 By default, it uses `Qwen/Qwen3-30B-A3B`, runs `DP+EP=1..GPU_COUNT`, uses
-`INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, and sets `NUM_PROMPTS` to
-`GPU_COUNT * 1000`. It runs two passes:
+`INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, and sets each case's prompt
+count to `DP_SIZE * 1000`. It runs two passes:
 
 - `throughput/`: clean online throughput run without torch profiling
 - `profile/`: same benchmark shape with module profiling enabled
 
 Pipeline outputs at the run root:
 
-- `qwen3_moe_dp_ep_throughput.svg`: number of GPUs vs total token throughput
-- `qwen3_moe_module_latency_stacked.svg`: stacked attention/FusedMoE average
+- `qwen3_moe_dp_ep_throughput.png`: number of GPUs vs total token throughput
+- `qwen3_moe_module_latency_stacked.png`: stacked attention/FusedMoE average
   CUDA latency
 - `profile/per_layer_module_summary.csv`: per-layer attention and FusedMoE
   latency rows when layer scopes are enabled
 - `profile/moe_comm_summary.csv`: MoE communication rows for the profiled run
 
-`DISABLE_PREFIX_CACHING=1` is enabled by default for this pipeline, implemented
-as `--no-enable-prefix-caching`. This disables prefix-cache reuse, not the KV
-cache itself. vLLM serving still uses KV cache for autoregressive decode; there
-is no normal serving flag that disables KV cache while preserving efficient
-generation.
+This pipeline always passes `--ignore-eos` to the benchmark command and
+`--no-enable-prefix-caching` to the server command. The prefix-cache flag
+disables prefix-cache reuse, not the KV cache itself. vLLM serving still uses KV
+cache for autoregressive decode; there is no normal serving flag that disables
+KV cache while preserving efficient generation.
 
 ## Common Knobs
 
@@ -219,7 +226,7 @@ INPUT_LEN=1024
 OUTPUT_LEN=128
 REQUEST_RATE=inf
 MAX_CONCURRENCY=
-MAX_MODEL_LEN=4096
+MAX_MODEL_LEN=
 ALL2ALL_BACKEND=allgather_reducescatter
 BASE_PORT=8100
 HOST=127.0.0.1
@@ -243,6 +250,9 @@ DISABLE_PREFIX_CACHING=0
 `CUDA_VISIBLE_DEVICES` and `GPU_COUNT` are set, the script uses the first
 `GPU_COUNT` entries from `CUDA_VISIBLE_DEVICES`. Explicit `TP_SIZES` and
 `DP_SIZES` override the detected defaults.
+
+Leave `MAX_MODEL_LEN` empty to use vLLM's model-derived default context length.
+Set it only when you intentionally want to pass `--max-model-len`.
 
 For the two-node Ray script, `VLLM_RAY_DP_PACK_STRATEGY` defaults to `strict`.
 On the current DP placement logic, a two-node one-GPU-per-node cluster cannot

@@ -143,7 +143,7 @@ class SingleNodeBenchmarkConfig:
     output_len: str = "128"
     request_rate: str = "inf"
     max_concurrency: str = ""
-    max_model_len: str = "4096"
+    max_model_len: str = ""
     result_root: Path = field(default_factory=default_result_root)
     server_start_timeout: int = 900
     server_extra_args: list[str] = field(default_factory=list)
@@ -271,9 +271,9 @@ class SingleNodeBenchmarkRunner:
             self.config.host,
             "--port",
             str(port),
-            "--max-model-len",
-            self.config.max_model_len,
         ]
+        if self.config.max_model_len:
+            cmd.extend(["--max-model-len", self.config.max_model_len])
         if self.config.disable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
         cmd.extend(server_args)
