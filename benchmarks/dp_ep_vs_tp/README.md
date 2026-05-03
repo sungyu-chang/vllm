@@ -118,6 +118,93 @@ Every run directory now includes a `README.md` with the experiment setup,
 planned cases, artifact locations, run notes, fix notes, and failure details if
 the run aborts.
 
+## Module Timing Profile
+
+The normal benchmark run reports online serving throughput and latency only. To
+collect averaged server-side module timings for attention and FusedMoE, enable
+the profiling pass:
+
+```bash
+PROFILE_MODULES=1 \
+MODEL=deepseek-ai/DeepSeek-V2-Lite \
+SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
+```
+
+or use:
+
+```bash
+just dp-ep-vs-tp-profile-modules
+```
+
+This starts `vllm serve` with the torch profiler, asks `vllm bench serve` to
+call `/start_profile` and `/stop_profile`, and enables custom profiler scopes
+inside the attention and FusedMoE module boundaries. Each case writes profiler
+artifacts under:
+
+```text
+benchmarks/dp_ep_vs_tp/results/<run>/profiler_traces/<case>/
+```
+
+The most directly useful file is `module_profiler_out_<rank>.txt`, which
+contains CSV-like rows:
+
+```text
+module,count,total_cuda_ms,avg_cuda_ms,total_cpu_ms,avg_cpu_ms
+vllm:attention,...
+vllm:fused_moe,...
+```
+
+The script also writes `module_summary.csv` at the run root. It includes one
+row per case/rank/module plus `rank=all` aggregate rows for quick comparison
+across EP sizes.
+
+When `PROFILE_LAYER_SCOPES=1`, the profiler also emits nested rows such as
+`vllm:attention:<layer_name>` and `vllm:fused_moe:<layer_name>`. The aggregate
+`vllm:attention` and `vllm:fused_moe` rows are still present for stacked-bar
+plots.
+
+For the default `allgather_reducescatter` all2all backend, the profiler also
+records `vllm:moe_comm` plus dispatch/combine detail rows. Other specialized
+MoE all2all backends may need backend-specific scopes before their internal
+communication can be separated cleanly from the fused MoE kernel.
+
+Use these profiling runs to understand the relative module breakdown. Do not
+mix them with clean throughput comparisons: torch profiling and custom scopes
+add overhead. By default, the script skips the first 5 engine iterations and
+profiles 20 iterations. Override with `PROFILE_DELAY_ITERATIONS` and
+`PROFILE_MAX_ITERATIONS`.
+
+## Qwen3-MoE DP+EP Pipeline
+
+Run the all-in-one single-node Qwen3-MoE DP+EP pipeline with:
+
+```bash
+just qwen3-moe-ep-pipeline
+```
+
+By default, it uses `Qwen/Qwen3-30B-A3B`, runs `DP+EP=1..GPU_COUNT`, uses
+`INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, and sets `NUM_PROMPTS` to
+`GPU_COUNT * 1000`. It runs two passes:
+
+- `throughput/`: clean online throughput run without torch profiling
+- `profile/`: same benchmark shape with module profiling enabled
+
+Pipeline outputs at the run root:
+
+- `qwen3_moe_dp_ep_throughput.svg`: number of GPUs vs total token throughput
+- `qwen3_moe_module_latency_stacked.svg`: stacked attention/FusedMoE average
+  CUDA latency
+- `profile/per_layer_module_summary.csv`: per-layer attention and FusedMoE
+  latency rows when layer scopes are enabled
+- `profile/moe_comm_summary.csv`: MoE communication rows for the profiled run
+
+`DISABLE_PREFIX_CACHING=1` is enabled by default for this pipeline, implemented
+as `--no-enable-prefix-caching`. This disables prefix-cache reuse, not the KV
+cache itself. vLLM serving still uses KV cache for autoregressive decode; there
+is no normal serving flag that disables KV cache while preserving efficient
+generation.
+
 ## Common Knobs
 
 Configure by environment variables:
@@ -143,6 +230,12 @@ VLLM_RAY_DP_PACK_STRATEGY=span
 SMOKE_RUN=0
 RUN_NOTES=
 FIX_NOTES=
+PROFILE_MODULES=0
+PROFILE_DELAY_ITERATIONS=5
+PROFILE_MAX_ITERATIONS=20
+PROFILE_WITH_STACK=0
+PROFILE_LAYER_SCOPES=0
+DISABLE_PREFIX_CACHING=0
 ```
 
 `GPU_COUNT` is optional. If it is unset, the script first honors

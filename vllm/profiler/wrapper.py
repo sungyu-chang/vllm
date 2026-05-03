@@ -258,6 +258,44 @@ class TorchProfilerWrapper(WorkerProfiler):
             with open(profiler_out_file, "w") as f:
                 print(table, file=f)
 
+    def _write_module_profiler_table(self, rank: int, table: str) -> None:
+        profiler_dir = self.profiler_config.torch_profiler_dir
+
+        if not _is_uri_path(profiler_dir):
+            profiler_out_file = f"{profiler_dir}/module_profiler_out_{rank}.txt"
+            with open(profiler_out_file, "w") as f:
+                print(table, file=f)
+
+    def _build_module_profiler_table(self) -> str:
+        rows: list[tuple[str, int, float, float, float]] = []
+        for event in self.profiler.key_averages():
+            if not event.key.startswith("vllm:"):
+                continue
+            count = event.count
+            cuda_total_us = getattr(
+                event,
+                "cuda_time_total",
+                getattr(event, "device_time_total", 0.0),
+            )
+            cpu_total_us = getattr(event, "cpu_time_total", 0.0)
+            rows.append((event.key, count, cuda_total_us, cpu_total_us, cuda_total_us))
+
+        if not rows:
+            return ""
+
+        rows.sort(key=lambda row: row[-1], reverse=True)
+        lines = [
+            "module,count,total_cuda_ms,avg_cuda_ms,total_cpu_ms,avg_cpu_ms",
+        ]
+        for name, count, cuda_total_us, cpu_total_us, _ in rows:
+            count = max(count, 1)
+            lines.append(
+                f"{name},{count},{cuda_total_us / 1000:.3f},"
+                f"{cuda_total_us / count / 1000:.3f},"
+                f"{cpu_total_us / 1000:.3f},{cpu_total_us / count / 1000:.3f}"
+            )
+        return "\n".join(lines)
+
     @override
     def _start(self) -> None:
         self.profiler.start()
@@ -275,6 +313,12 @@ class TorchProfilerWrapper(WorkerProfiler):
             # only print profiler results on rank 0
             if rank == 0:
                 print(table)
+
+            module_table = self._build_module_profiler_table()
+            if module_table:
+                self._write_module_profiler_table(rank, module_table)
+                if rank == 0:
+                    print(module_table)
 
         if self.dump_cpu_time_total:
             table = self._build_profiler_table(

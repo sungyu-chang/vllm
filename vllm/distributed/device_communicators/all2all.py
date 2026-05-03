@@ -11,6 +11,7 @@ from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.profiler.scopes import moe_comm_detail, module_profile_scope
 from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
@@ -71,11 +72,15 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        with module_profile_scope(
+            "vllm:moe_comm",
+            moe_comm_detail("dispatch_router_logits"),
+        ):
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -106,11 +111,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        with module_profile_scope("vllm:moe_comm", moe_comm_detail("dispatch")):
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
@@ -133,7 +139,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        with module_profile_scope("vllm:moe_comm", moe_comm_detail("combine")):
+            hidden_states = dist_group.reduce_scatterv(
+                hidden_states,
+                dim=0,
+                sizes=sizes,
+            )
         return hidden_states
 
     def destroy(self):

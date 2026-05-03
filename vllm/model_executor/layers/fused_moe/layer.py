@@ -57,6 +57,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.scopes import moe_profile_scope
 
 logger = init_logger(__name__)
 
@@ -1548,11 +1549,12 @@ class FusedMoE(PluggableLayer):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.runner.forward(
-            hidden_states,
-            router_logits,
-            input_ids,
-        )
+        with moe_profile_scope("vllm:fused_moe", self.layer_name):
+            return self.runner.forward(
+                hidden_states,
+                router_logits,
+                input_ids,
+            )
 
     @property
     def expert_map(self) -> torch.Tensor | None:

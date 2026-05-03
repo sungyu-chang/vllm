@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+from vllm.profiler.scopes import module_profile_scope
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -459,45 +460,46 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
-        if self.use_direct_call:
-            # Skip this if sharing KV cache with an earlier attention layer.
-            if (
-                not self.attn_backend.forward_includes_kv_cache_update
-                and self.kv_sharing_target_layer_name is None
-                and key is not None
-                and value is not None
-            ):
-                kv_cache_dummy_dep = unified_kv_cache_update(
-                    key, value, self.layer_name
+        with module_profile_scope("vllm:attention", self.layer_name):
+            if self.use_direct_call:
+                # Skip this if sharing KV cache with an earlier attention layer.
+                if (
+                    not self.attn_backend.forward_includes_kv_cache_update
+                    and self.kv_sharing_target_layer_name is None
+                    and key is not None
+                    and value is not None
+                ):
+                    kv_cache_dummy_dep = unified_kv_cache_update(
+                        key, value, self.layer_name
+                    )
+                unified_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    self.layer_name,
+                    kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
-            unified_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                self.layer_name,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
-            )
-        else:
-            # Skip this if sharing KV cache with an earlier attention layer.
-            encoded = _encode_layer_name(self.layer_name)
-            if (
-                not self.attn_backend.forward_includes_kv_cache_update
-                and self.kv_sharing_target_layer_name is None
-                and key is not None
-                and value is not None
-            ):
-                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                    key, value, encoded
+            else:
+                # Skip this if sharing KV cache with an earlier attention layer.
+                encoded = _encode_layer_name(self.layer_name)
+                if (
+                    not self.attn_backend.forward_includes_kv_cache_update
+                    and self.kv_sharing_target_layer_name is None
+                    and key is not None
+                    and value is not None
+                ):
+                    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+                        key, value, encoded
+                    )
+                torch.ops.vllm.unified_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    encoded,
+                    kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
-            torch.ops.vllm.unified_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                encoded,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
-            )
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
