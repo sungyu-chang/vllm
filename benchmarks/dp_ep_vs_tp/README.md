@@ -27,8 +27,60 @@ total-token throughput, TTFT, TPOT, and E2E latency.
 From the repo root, after setting up the vLLM environment:
 
 ```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
 MODEL=deepseek-ai/DeepSeek-V2-Lite \
 SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
+```
+
+For the one-node TP vs DP+EP online benchmark requested in this repo on an
+8-GPU node with `input_len=128`, `output_len=256`, and `num_prompts=1000`:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+MODEL=Qwen/Qwen1.5-MoE-A2.7B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+TP_SIZES="1 2 4 8" \
+DP_SIZES="1 2 4 8" \
+INPUT_LEN=128 \
+OUTPUT_LEN=256 \
+NUM_PROMPTS=1000 \
+REQUEST_RATE=inf \
+RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen1.5-MoE-A2.7B, input 128, output 256" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
+```
+
+For the expanded one-node sweep requested for Qwen MoE models with
+`TP_SIZES="1 2 4 8"`, `DP_SIZES="1 2 3 4 5 6 7 8"`, `input_len=128`,
+`output_len=256`, and `num_prompts=5000`, use the suite wrapper. It runs the
+Qwen1.5 MoE and Qwen3 MoE 30B experiments as separate run directories and then
+generates a combined CSV, Markdown summary, and SVG figure without manual
+polling:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py
+```
+
+Artifacts from the analysis step are written under:
+
+```text
+results/dp_ep_vs_tp/analysis/<timestamp>/
+```
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+MODEL=Qwen/Qwen3-30B-A3B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+TP_SIZES="1 2 4 8" \
+DP_SIZES="1 2 4 8" \
+INPUT_LEN=128 \
+OUTPUT_LEN=256 \
+NUM_PROMPTS=1000 \
+REQUEST_RATE=inf \
+RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen3-30B-A3B, input 128, output 256" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
 ```
 
