@@ -281,8 +281,11 @@ Use `REQUEST_RATE=inf` for saturation-style throughput. Use finite request
 rates plus `MAX_CONCURRENCY` to study latency/throughput tradeoffs.
 `MAX_CONCURRENCY` is an absolute client-side cap for the whole case. Set
 `MAX_CONCURRENCY_PER_GPU` to scale that cap by the number of GPUs/DP ranks in
-each case; for example, `MAX_CONCURRENCY_PER_GPU=512` uses `3072` for DP6 and
-`3584` for DP7. If both are set, `MAX_CONCURRENCY` takes precedence.
+each case; for example, `MAX_CONCURRENCY_PER_GPU=1001` uses `6006` for DP6 and
+`7007` for DP7 with the default `PROMPTS_PER_GPU=1000`. If both are set,
+`MAX_CONCURRENCY` takes precedence. When a concurrency cap is configured, the
+harness requires the computed cap to be greater than that case's `num_prompts`
+so the benchmark is not accidentally throttled below the prompt count.
 
 ## Notes For Fair Comparisons
 

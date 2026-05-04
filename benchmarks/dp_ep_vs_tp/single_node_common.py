@@ -174,20 +174,49 @@ class SingleNodeBenchmarkConfig:
         return len(self.gpu_ids)
 
     def num_prompts_for_gpu_count(self, gpu_count: int) -> str:
+        return str(self.num_prompts_count_for_gpu_count(gpu_count))
+
+    def num_prompts_count_for_gpu_count(self, gpu_count: int) -> int:
         if self.num_prompts:
             explicit_num_prompts = int(self.num_prompts)
-            if explicit_num_prompts > 0:
-                return str(explicit_num_prompts)
-        return str(self.prompts_per_gpu * gpu_count)
+            if explicit_num_prompts <= 0:
+                raise SystemExit("NUM_PROMPTS must be positive when set")
+            return explicit_num_prompts
+        if self.prompts_per_gpu <= 0:
+            raise SystemExit("PROMPTS_PER_GPU must be positive")
+        return self.prompts_per_gpu * gpu_count
 
     def max_concurrency_for_gpu_count(self, gpu_count: int) -> str:
+        max_concurrency = self.max_concurrency_count_for_gpu_count(gpu_count)
+        return str(max_concurrency) if max_concurrency is not None else ""
+
+    def max_concurrency_count_for_gpu_count(self, gpu_count: int) -> int | None:
         if self.max_concurrency:
-            return self.max_concurrency
+            max_concurrency = int(self.max_concurrency)
+            if max_concurrency <= 0:
+                raise SystemExit("MAX_CONCURRENCY must be positive when set")
+            return max_concurrency
         if self.max_concurrency_per_gpu:
             per_gpu = int(self.max_concurrency_per_gpu)
-            if per_gpu > 0:
-                return str(per_gpu * gpu_count)
-        return ""
+            if per_gpu <= 0:
+                raise SystemExit(
+                    "MAX_CONCURRENCY_PER_GPU must be positive when set"
+                )
+            return per_gpu * gpu_count
+        return None
+
+    def validate_case_concurrency(self, case_name: str, gpu_count: int) -> None:
+        max_concurrency = self.max_concurrency_count_for_gpu_count(gpu_count)
+        if max_concurrency is None:
+            return
+        num_prompts = self.num_prompts_count_for_gpu_count(gpu_count)
+        if max_concurrency <= num_prompts:
+            raise SystemExit(
+                f"{case_name}: configured max concurrency ({max_concurrency}) "
+                f"must be greater than num_prompts ({num_prompts}). "
+                "Increase MAX_CONCURRENCY/MAX_CONCURRENCY_PER_GPU or reduce "
+                "NUM_PROMPTS/PROMPTS_PER_GPU."
+            )
 
 
 class SingleNodeBenchmarkRunner:
@@ -390,6 +419,7 @@ class SingleNodeBenchmarkRunner:
         cuda_devices = self.gpu_list(gpu_count)
 
         print(f"=== {case_name} on GPUs {cuda_devices} port {port} ===", flush=True)
+        self.config.validate_case_concurrency(case_name, gpu_count)
         self.cleanup_server()
         self.wait_for_port_to_close(port)
 
