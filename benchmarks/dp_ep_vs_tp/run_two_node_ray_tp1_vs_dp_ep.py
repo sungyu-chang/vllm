@@ -36,9 +36,10 @@ MODEL = env("MODEL", "allenai/OLMoE-1B-7B-0924-Instruct")
 SERVED_MODEL_NAME = env("SERVED_MODEL_NAME", "bench-model")
 HOST = env("HOST", "127.0.0.1")
 BASE_PORT = int(env("BASE_PORT", "8200"))
-NUM_PROMPTS = env("NUM_PROMPTS", "1000")
-INPUT_LEN = env("INPUT_LEN", "1024")
-OUTPUT_LEN = env("OUTPUT_LEN", "128")
+PROMPTS_PER_GPU = int(env("PROMPTS_PER_GPU", "1000"))
+NUM_PROMPTS = env("NUM_PROMPTS", str(PROMPTS_PER_GPU * 2))
+INPUT_LEN = env("INPUT_LEN", "1")
+OUTPUT_LEN = env("OUTPUT_LEN", "256")
 REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
 MAX_MODEL_LEN = env("MAX_MODEL_LEN", "")
@@ -50,6 +51,14 @@ SERVER_RETRY_DELAY_SECONDS = int(env("SERVER_RETRY_DELAY_SECONDS", "10"))
 PORT_RELEASE_TIMEOUT = int(env("PORT_RELEASE_TIMEOUT", "60"))
 SERVER_EXTRA_ARGS = shlex.split(env("SERVER_EXTRA_ARGS", "--dtype float16"))
 BENCH_EXTRA_ARGS = shlex.split(env("BENCH_EXTRA_ARGS", ""))
+if "--ignore-eos" not in BENCH_EXTRA_ARGS:
+    BENCH_EXTRA_ARGS.insert(0, "--ignore-eos")
+DISABLE_PREFIX_CACHING = env("DISABLE_PREFIX_CACHING", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 PYTHON_BIN = env("PYTHON_BIN", sys.executable)
 RAY_DP_PACK_STRATEGY = env("VLLM_RAY_DP_PACK_STRATEGY", "strict")
 RUN_NOTES = env("RUN_NOTES", "")
@@ -169,6 +178,8 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
     ]
     if MAX_MODEL_LEN:
         server_cmd.extend(["--max-model-len", MAX_MODEL_LEN])
+    if DISABLE_PREFIX_CACHING:
+        server_cmd.append("--no-enable-prefix-caching")
     server_env = {
         **os.environ,
         "VLLM_RAY_DP_PACK_STRATEGY": RAY_DP_PACK_STRATEGY,
@@ -240,6 +251,8 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         f"case={case_name}",
         f"model={MODEL}",
         "gpu_count=2",
+        f"num_prompts={NUM_PROMPTS}",
+        f"prompts_per_gpu={PROMPTS_PER_GPU}",
         "nodes=2",
         "gpus_per_node=1",
         f"input_len={INPUT_LEN}",
@@ -299,6 +312,7 @@ def write_run_summary(*, status: str, started_at: str,
             "host": HOST,
             "base_port": str(BASE_PORT),
             "num_prompts": NUM_PROMPTS,
+            "prompts_per_gpu": str(PROMPTS_PER_GPU),
             "input_len": INPUT_LEN,
             "output_len": OUTPUT_LEN,
             "request_rate": REQUEST_RATE,
@@ -311,6 +325,7 @@ def write_run_summary(*, status: str, started_at: str,
             "port_release_timeout": str(PORT_RELEASE_TIMEOUT),
             "server_extra_args": " ".join(SERVER_EXTRA_ARGS) or "(none)",
             "bench_extra_args": " ".join(BENCH_EXTRA_ARGS) or "(none)",
+            "disable_prefix_caching": str(DISABLE_PREFIX_CACHING).lower(),
             "python_bin": PYTHON_BIN,
             "ray_dp_pack_strategy": RAY_DP_PACK_STRATEGY,
             "smoke_run": str(RESULT_ROOT.name.endswith("_smoke")).lower(),

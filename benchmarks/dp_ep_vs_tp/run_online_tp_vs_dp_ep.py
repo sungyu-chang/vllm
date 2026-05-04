@@ -24,6 +24,7 @@ from single_node_common import (
     env_bool,
     shlex_env,
     validate_sizes,
+    with_default_flag,
 )
 
 
@@ -34,23 +35,27 @@ def build_config(gpu_ids: list[str]) -> SingleNodeBenchmarkConfig:
         host=env("HOST", "127.0.0.1"),
         base_port=int(env("BASE_PORT", "8100")),
         gpu_ids=gpu_ids,
-        num_prompts=env("NUM_PROMPTS", "1000"),
-        input_len=env("INPUT_LEN", "1024"),
-        output_len=env("OUTPUT_LEN", "128"),
+        num_prompts=env("NUM_PROMPTS", ""),
+        prompts_per_gpu=int(env("PROMPTS_PER_GPU", "1000")),
+        input_len=env("INPUT_LEN", "1"),
+        output_len=env("OUTPUT_LEN", "256"),
         request_rate=env("REQUEST_RATE", "inf"),
         max_concurrency=env("MAX_CONCURRENCY", ""),
+        max_concurrency_per_gpu=env("MAX_CONCURRENCY_PER_GPU", ""),
         max_model_len=env("MAX_MODEL_LEN", ""),
         result_root=build_result_root("dp_ep_vs_tp", "one_node_online"),
         server_start_timeout=int(env("SERVER_START_TIMEOUT", "900")),
         server_extra_args=shlex_env("SERVER_EXTRA_ARGS"),
-        bench_extra_args=shlex_env("BENCH_EXTRA_ARGS"),
+        bench_extra_args=with_default_flag(
+            shlex_env("BENCH_EXTRA_ARGS"), "--ignore-eos"
+        ),
         python_bin=env("PYTHON_BIN", ".venv/bin/python"),
         profile_modules=env_bool("PROFILE_MODULES"),
         profile_delay_iterations=int(env("PROFILE_DELAY_ITERATIONS", "5")),
         profile_max_iterations=int(env("PROFILE_MAX_ITERATIONS", "20")),
         profile_with_stack=env_bool("PROFILE_WITH_STACK"),
         profile_layer_scopes=env_bool("PROFILE_LAYER_SCOPES"),
-        disable_prefix_caching=env_bool("DISABLE_PREFIX_CACHING"),
+        disable_prefix_caching=env_bool("DISABLE_PREFIX_CACHING", True),
         port_release_timeout=int(env("PORT_RELEASE_TIMEOUT", "60")),
     )
 
@@ -96,13 +101,15 @@ def write_run_summary(
             "gpu_count": str(config.gpu_count),
             "tp_sizes": " ".join(str(size) for size in tp_sizes),
             "dp_sizes": " ".join(str(size) for size in dp_sizes),
-            "num_prompts": config.num_prompts,
+            "num_prompts": config.num_prompts or "prompts_per_gpu * case_gpu_count",
+            "prompts_per_gpu": str(config.prompts_per_gpu),
             "input_len": config.input_len,
             "output_len": config.output_len,
             "request_rate": config.request_rate,
             "max_concurrency": config.max_concurrency or "unset",
+            "max_concurrency_per_gpu": config.max_concurrency_per_gpu or "unset",
             "max_model_len": config.max_model_len or "vLLM default",
-            "all2all_backend": all2all_backend,
+            "all2all_backend": all2all_backend or "vLLM default (argument omitted)",
             "server_start_timeout": str(config.server_start_timeout),
             "port_release_timeout": str(config.port_release_timeout),
             "server_extra_args": " ".join(config.server_extra_args) or "(none)",
@@ -124,12 +131,21 @@ def write_run_summary(
 def main() -> int:
     gpu_ids = detect_gpu_ids()
     gpu_count = len(gpu_ids)
-    tp_sizes = configured_sizes("TP_SIZES", default_tp_sizes(gpu_count))
-    dp_sizes = configured_sizes("DP_SIZES", default_dp_sizes(gpu_count))
-    validate_sizes("TP_SIZES", tp_sizes, gpu_count)
-    validate_sizes("DP_SIZES", dp_sizes, gpu_count)
+    run_tp = env_bool("RUN_TP", True)
+    run_dp_ep = env_bool("RUN_DP_EP", True)
+    if not run_tp and not run_dp_ep:
+        raise SystemExit("At least one of RUN_TP or RUN_DP_EP must be enabled")
 
-    all2all_backend = env("ALL2ALL_BACKEND", "allgather_reducescatter")
+    tp_sizes = (configured_sizes("TP_SIZES", default_tp_sizes(gpu_count))
+                if run_tp else [])
+    dp_sizes = (configured_sizes("DP_SIZES", default_dp_sizes(gpu_count))
+                if run_dp_ep else [])
+    if run_tp:
+        validate_sizes("TP_SIZES", tp_sizes, gpu_count)
+    if run_dp_ep:
+        validate_sizes("DP_SIZES", dp_sizes, gpu_count)
+
+    all2all_backend = env("ALL2ALL_BACKEND", "")
     config = build_config(gpu_ids)
     runner = SingleNodeBenchmarkRunner(config)
     runner.require_command("vllm")
@@ -164,19 +180,20 @@ def main() -> int:
             case_index += 1
 
         for dp_size in dp_sizes:
+            server_args = [
+                "--data-parallel-size",
+                str(dp_size),
+                "--data-parallel-size-local",
+                str(dp_size),
+                "--enable-expert-parallel",
+            ]
+            if all2all_backend:
+                server_args.extend(["--all2all-backend", all2all_backend])
             runner.run_case(
                 case_name=f"dp{dp_size}_ep",
                 gpu_count=dp_size,
                 port=config.base_port + case_index,
-                server_args=[
-                    "--data-parallel-size",
-                    str(dp_size),
-                    "--data-parallel-size-local",
-                    str(dp_size),
-                    "--enable-expert-parallel",
-                    "--all2all-backend",
-                    all2all_backend,
-                ],
+                server_args=server_args,
                 metadata={
                     "parallelism": "dp_ep",
                     "dp_size": dp_size,

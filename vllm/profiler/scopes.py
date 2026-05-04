@@ -41,6 +41,10 @@ def module_profile_scope(
 
 @contextmanager
 def moe_profile_scope(name: str, layer_name: str) -> Iterator[None]:
+    if not envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+        yield
+        return
+
     token = _CURRENT_MOE_LAYER.set(layer_name)
     try:
         with module_profile_scope(name, layer_name):

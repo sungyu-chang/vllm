@@ -34,7 +34,8 @@ SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
 ```
 
 For the one-node TP vs DP+EP online benchmark requested in this repo on an
-8-GPU node with `input_len=128`, `output_len=256`, and `num_prompts=1000`:
+8-GPU node with `input_len=1`, `output_len=256`, `--ignore-eos`, prefix
+caching disabled, and per-case prompts set to `1000 * GPUs used`:
 
 ```bash
 PATH="$(pwd)/.venv/bin:$PATH" \
@@ -43,24 +44,32 @@ SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
 TP_SIZES="1 2 4 8" \
 DP_SIZES="1 2 4 8" \
-INPUT_LEN=128 \
-OUTPUT_LEN=256 \
-NUM_PROMPTS=1000 \
 REQUEST_RATE=inf \
-RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen1.5-MoE-A2.7B, input 128, output 256" \
+RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen1.5-MoE-A2.7B, input 1, output 256" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
 ```
 
-For the expanded one-node sweep requested for Qwen MoE models with
-`TP_SIZES="1 2 4 8"`, `DP_SIZES="1 2 3 4 5 6 7 8"`, `input_len=128`,
-`output_len=256`, and `num_prompts=5000`, use the suite wrapper. It runs the
-Qwen1.5 MoE and Qwen3 MoE 30B experiments as separate run directories and then
-generates a combined CSV, Markdown summary, and PNG figure without manual
-polling:
+For the expanded one-node DP+EP sweep requested for Qwen MoE models, use the
+suite wrapper. By default, it detects the visible GPU count, runs `DP+EP=1..N`,
+uses `input_len=1`, `output_len=256`, `--ignore-eos`, disables prefix caching,
+sets each case's prompt count to `1000 * GPUs used`, and skips TP baselines. It
+runs the Qwen1.5 MoE and Qwen3 MoE 30B experiments as separate run directories
+and then generates a combined CSV, Markdown summary, and PNG figure without
+manual polling:
 
 ```bash
 PATH="$(pwd)/.venv/bin:$PATH" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py
+```
+
+To include TP baselines as well, pass `--include-tp`. TP sizes default to powers
+of two up to the detected GPU count, or can be overridden explicitly:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py \
+  --include-tp \
+  --tp-sizes "1 2 4"
 ```
 
 Artifacts from the analysis step are written under:
@@ -76,11 +85,8 @@ SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
 TP_SIZES="1 2 4 8" \
 DP_SIZES="1 2 4 8" \
-INPUT_LEN=128 \
-OUTPUT_LEN=256 \
-NUM_PROMPTS=1000 \
 REQUEST_RATE=inf \
-RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen3-30B-A3B, input 128, output 256" \
+RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen3-30B-A3B, input 1, output 256" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
 ```
 
@@ -192,7 +198,7 @@ just qwen3-moe-ep-pipeline
 
 By default, it uses `Qwen/Qwen3-30B-A3B`, runs `DP+EP=1..GPU_COUNT`, uses
 `INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, and sets each case's prompt
-count to `DP_SIZE * 1000`. It runs two passes:
+count to `1000 * GPUs used`. It runs two passes:
 
 - `throughput/`: clean online throughput run without torch profiling
 - `profile/`: same benchmark shape with module profiling enabled
@@ -221,17 +227,19 @@ MODEL=deepseek-ai/DeepSeek-V2-Lite
 GPU_COUNT=8
 TP_SIZES="1 2 4 8"
 DP_SIZES="1 2 3 4 5 6 7 8"
-NUM_PROMPTS=1000
-INPUT_LEN=1024
-OUTPUT_LEN=128
+NUM_PROMPTS=
+PROMPTS_PER_GPU=1000
+INPUT_LEN=1
+OUTPUT_LEN=256
 REQUEST_RATE=inf
 MAX_CONCURRENCY=
+MAX_CONCURRENCY_PER_GPU=
 MAX_MODEL_LEN=
 ALL2ALL_BACKEND=allgather_reducescatter
 BASE_PORT=8100
 HOST=127.0.0.1
 SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16"
-BENCH_EXTRA_ARGS="--ignore-eos"
+BENCH_EXTRA_ARGS=
 PYTHON_BIN=.venv/bin/python
 VLLM_RAY_DP_PACK_STRATEGY=span
 SMOKE_RUN=0
@@ -242,7 +250,7 @@ PROFILE_DELAY_ITERATIONS=5
 PROFILE_MAX_ITERATIONS=20
 PROFILE_WITH_STACK=0
 PROFILE_LAYER_SCOPES=0
-DISABLE_PREFIX_CACHING=0
+DISABLE_PREFIX_CACHING=1
 ```
 
 `GPU_COUNT` is optional. If it is unset, the script first honors
@@ -250,6 +258,11 @@ DISABLE_PREFIX_CACHING=0
 `CUDA_VISIBLE_DEVICES` and `GPU_COUNT` are set, the script uses the first
 `GPU_COUNT` entries from `CUDA_VISIBLE_DEVICES`. Explicit `TP_SIZES` and
 `DP_SIZES` override the detected defaults.
+
+By default, every case uses `INPUT_LEN=1`, `OUTPUT_LEN=256`, appends
+`--ignore-eos` to `vllm bench serve`, and starts `vllm serve` with
+`--no-enable-prefix-caching`. Unless `NUM_PROMPTS` is set explicitly, each case
+uses `PROMPTS_PER_GPU * GPUs used`; the default `PROMPTS_PER_GPU` is `1000`.
 
 Leave `MAX_MODEL_LEN` empty to use vLLM's model-derived default context length.
 Set it only when you intentionally want to pass `--max-model-len`.
@@ -266,6 +279,10 @@ failure.
 
 Use `REQUEST_RATE=inf` for saturation-style throughput. Use finite request
 rates plus `MAX_CONCURRENCY` to study latency/throughput tradeoffs.
+`MAX_CONCURRENCY` is an absolute client-side cap for the whole case. Set
+`MAX_CONCURRENCY_PER_GPU` to scale that cap by the number of GPUs/DP ranks in
+each case; for example, `MAX_CONCURRENCY_PER_GPU=512` uses `3072` for DP6 and
+`3584` for DP7. If both are set, `MAX_CONCURRENCY` takes precedence.
 
 ## Notes For Fair Comparisons
 

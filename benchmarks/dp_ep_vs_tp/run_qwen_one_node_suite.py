@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run one-node TP vs DP+EP benchmarks for Qwen MoE presets.
+"""Run one-node DP+EP benchmarks for Qwen MoE presets.
 
 This wrapper launches separate one-node runs for Qwen1.5 MoE and Qwen3 MoE,
-using fixed TP sizes of 1, 2, 4, and 8, DP+EP sizes of 1 through 8, and then
-invokes the analysis script after both runs complete.
+using DP+EP sizes from 1 through the detected GPU count by default, and then
+invokes the analysis script after all requested runs complete. TP baselines can
+be included explicitly with --include-tp.
 """
 
 from __future__ import annotations
@@ -26,32 +27,23 @@ ANALYSIS_ROOT = REPO_ROOT / "results" / "dp_ep_vs_tp" / "analysis"
 class ModelSpec:
     name: str
     model_id: str
-    run_notes: str
 
 
 MODEL_PRESETS = {
     "qwen1.5": ModelSpec(
         name="qwen1.5",
         model_id="Qwen/Qwen1.5-MoE-A2.7B",
-        run_notes=(
-            "Single-node TP vs DP+EP comparison for Qwen1.5-MoE-A2.7B, "
-            "input 128, output 256, 5000 prompts, TP=1/2/4/8, DP+EP=1..8"
-        ),
     ),
     "qwen3": ModelSpec(
         name="qwen3",
         model_id="Qwen/Qwen3-30B-A3B",
-        run_notes=(
-            "Single-node TP vs DP+EP comparison for Qwen3-30B-A3B, "
-            "input 128, output 256, 5000 prompts, TP=1/2/4/8, DP+EP=1..8"
-        ),
     ),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Qwen one-node TP vs DP+EP experiments and analyze them.")
+        description="Run Qwen one-node DP+EP experiments and analyze them.")
     parser.add_argument(
         "--models",
         nargs="+",
@@ -59,16 +51,69 @@ def parse_args() -> argparse.Namespace:
         default=["qwen1.5", "qwen3"],
         help="Model presets to run. Defaults to both Qwen1.5 and Qwen3.",
     )
-    parser.add_argument("--gpu-count", default="8")
-    parser.add_argument("--tp-sizes", default="1 2 4 8")
-    parser.add_argument("--dp-sizes", default="1 2 3 4 5 6 7 8")
-    parser.add_argument("--input-len", default="128")
+    parser.add_argument(
+        "--gpu-count",
+        default=None,
+        help="GPU count to use. Defaults to CUDA_VISIBLE_DEVICES or nvidia-smi.",
+    )
+    parser.add_argument(
+        "--include-tp",
+        action="store_true",
+        help="Also run TP baselines. Defaults to DP+EP only.",
+    )
+    parser.add_argument(
+        "--tp-sizes",
+        default=None,
+        help="Space-separated TP sizes. Defaults to powers of two when --include-tp is set.",
+    )
+    parser.add_argument(
+        "--dp-sizes",
+        default=None,
+        help="Space-separated DP+EP sizes. Defaults to 1 through the detected GPU count.",
+    )
+    parser.add_argument("--input-len", default="1")
     parser.add_argument("--output-len", default="256")
-    parser.add_argument("--num-prompts", default="5000")
+    parser.add_argument(
+        "--num-prompts",
+        default=None,
+        help="Override per-case prompt count. Defaults to 1000 * GPUs used.",
+    )
     parser.add_argument("--request-rate", default="inf")
+    parser.add_argument(
+        "--max-concurrency",
+        default=None,
+        help="Absolute benchmark client max concurrency for every case.",
+    )
+    parser.add_argument(
+        "--max-concurrency-per-gpu",
+        default=None,
+        help="Benchmark client max concurrency per GPU/DP rank, scaled by case size.",
+    )
     parser.add_argument("--server-extra-args", default="--dtype bfloat16")
-    parser.add_argument("--all2all-backend", default="allgather_reducescatter")
+    parser.add_argument(
+        "--all2all-backend",
+        default=None,
+        help="Explicit DP+EP all2all backend. Defaults to omitting the vLLM flag.",
+    )
     return parser.parse_args()
+
+
+def build_run_notes(spec: ModelSpec, args: argparse.Namespace) -> str:
+    gpu_scope = args.gpu_count or "detected GPU count"
+    dp_scope = args.dp_sizes or f"1..{gpu_scope}"
+    tp_scope = args.tp_sizes if args.include_tp else "disabled"
+    if args.include_tp and args.tp_sizes is None:
+        tp_scope = f"powers of two up to {gpu_scope}"
+    return (
+        f"Single-node DP+EP comparison for {spec.model_id}, "
+        f"input {args.input_len}, output {args.output_len}, "
+        f"prompts={args.num_prompts or '1000 * GPUs used'}, "
+        f"max_concurrency={args.max_concurrency or 'unset'}, "
+        f"max_concurrency_per_gpu={args.max_concurrency_per_gpu or 'unset'}, "
+        f"TP={tp_scope}, DP+EP={dp_scope}, ignore_eos=true, "
+        "disable_prefix_caching=true, "
+        f"all2all_backend={args.all2all_backend or 'vLLM default'}"
+    )
 
 
 def existing_run_dirs() -> set[Path]:
@@ -93,17 +138,28 @@ def run_model(spec: ModelSpec, args: argparse.Namespace) -> Path:
     env.update({
         "MODEL": spec.model_id,
         "SERVER_EXTRA_ARGS": args.server_extra_args,
-        "GPU_COUNT": args.gpu_count,
-        "TP_SIZES": args.tp_sizes,
-        "DP_SIZES": args.dp_sizes,
+        "RUN_TP": "1" if args.include_tp else "0",
+        "RUN_DP_EP": "1",
         "INPUT_LEN": args.input_len,
         "OUTPUT_LEN": args.output_len,
-        "NUM_PROMPTS": args.num_prompts,
         "REQUEST_RATE": args.request_rate,
-        "ALL2ALL_BACKEND": args.all2all_backend,
-        "RUN_NOTES": spec.run_notes,
+        "RUN_NOTES": build_run_notes(spec, args),
         "PYTHON_BIN": str(REPO_ROOT / ".venv" / "bin" / "python"),
     })
+    if args.all2all_backend is not None:
+        env["ALL2ALL_BACKEND"] = args.all2all_backend
+    if args.gpu_count is not None:
+        env["GPU_COUNT"] = args.gpu_count
+    if args.num_prompts is not None:
+        env["NUM_PROMPTS"] = args.num_prompts
+    if args.max_concurrency is not None:
+        env["MAX_CONCURRENCY"] = args.max_concurrency
+    if args.max_concurrency_per_gpu is not None:
+        env["MAX_CONCURRENCY_PER_GPU"] = args.max_concurrency_per_gpu
+    if args.include_tp and args.tp_sizes is not None:
+        env["TP_SIZES"] = args.tp_sizes
+    if args.dp_sizes is not None:
+        env["DP_SIZES"] = args.dp_sizes
 
     before = existing_run_dirs()
     subprocess.run(
@@ -125,7 +181,7 @@ def analyze_runs(run_dirs: list[Path]) -> Path:
             "--output-dir",
             str(analysis_dir),
             "--title",
-            "Qwen TP vs DP+EP Total Token Throughput",
+            "Qwen DP+EP Total Token Throughput",
         ],
         cwd=REPO_ROOT,
         check=True,

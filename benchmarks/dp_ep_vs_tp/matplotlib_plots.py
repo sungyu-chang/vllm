@@ -12,13 +12,14 @@ def pyplot():
     try:
         import matplotlib
         matplotlib.use("Agg")
+        import academia_style
         import matplotlib.pyplot as plt
     except ImportError as exc:
         raise SystemExit(
             "matplotlib is required for benchmark figures. Install the "
             "benchmark extra, for example: uv pip install -e '.[bench]'"
         ) from exc
-    return plt
+    return plt, academia_style
 
 
 def save_line_plot(
@@ -31,14 +32,14 @@ def save_line_plot(
     y_label: str,
     color: str = "#1f5f5b",
 ) -> None:
-    plt = pyplot()
+    plt, academia_style = pyplot()
     fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=120)
-    ax.plot(x_values, y_values, marker="o", linewidth=2.5, color=color)
+    ax.plot(x_values, y_values, marker=academia_style.MARKERS[0], color=color)
     ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_xticks(x_values)
-    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.6)
+    academia_style.style_fig(fig, enforce=True)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
@@ -53,7 +54,7 @@ def save_stacked_bar_plot(
     x_label: str,
     y_label: str,
 ) -> None:
-    plt = pyplot()
+    plt, academia_style = pyplot()
     fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=120)
     bottoms = [0.0 for _ in x_values]
     for label, color, values in series:
@@ -64,8 +65,8 @@ def save_stacked_bar_plot(
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_xticks(x_values)
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.legend()
+    academia_style.style_fig(fig, legend_ncol=len(series), enforce=True)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
@@ -78,7 +79,7 @@ def save_series_panels(
     model_series: dict[str, dict[str, list[tuple[int, float]]]],
     colors: dict[str, str],
 ) -> None:
-    plt = pyplot()
+    plt, academia_style = pyplot()
     models = list(model_series.items())
     fig_height = max(3.2 * len(models), 3.2)
     fig, axes = plt.subplots(
@@ -99,7 +100,7 @@ def save_series_panels(
     })
 
     for ax, (model_name, series_map) in zip(axes_flat, models):
-        for series_name, color in colors.items():
+        for series_index, (series_name, color) in enumerate(colors.items()):
             points = series_map.get(series_name, [])
             if not points:
                 continue
@@ -108,14 +109,17 @@ def save_series_panels(
             ax.plot(
                 x_values,
                 y_values,
-                marker="o",
-                linewidth=2.5,
+                marker=academia_style.MARKERS[
+                    series_index % len(academia_style.MARKERS)
+                ],
+                linestyle=academia_style.LINESTYLES[
+                    series_index % len(academia_style.LINESTYLES)
+                ],
                 label=series_name,
                 color=color,
             )
         ax.set_title(model_name, loc="left")
         ax.set_ylabel("Total token throughput")
-        ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.6)
         ax.legend()
 
     axes_flat[-1].set_xlabel("GPUs involved")
@@ -123,6 +127,7 @@ def save_series_panels(
         axes_flat[-1].set_xticks(all_gpu_counts)
 
     fig.suptitle(title)
+    academia_style.style_fig(fig, legend_ncol=len(colors), enforce=True)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)

@@ -41,6 +41,16 @@ def env_list(name: str, default: str) -> list[int]:
         raise SystemExit(f"{name} must be a space-separated list of integers") from exc
 
 
+def shlex_env(name: str, default: str = "") -> list[str]:
+    return shlex.split(env(name, default))
+
+
+def with_default_flag(args: list[str], flag: str) -> list[str]:
+    if flag in args:
+        return args
+    return [flag, *args]
+
+
 def parse_cuda_visible_devices() -> list[str] | None:
     raw = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw is None or raw.strip() in ("", "-1", "NoDevFiles"):
@@ -138,11 +148,13 @@ class SingleNodeBenchmarkConfig:
     host: str = "127.0.0.1"
     base_port: int = 8100
     gpu_ids: list[str] = field(default_factory=detect_gpu_ids)
-    num_prompts: str = "1000"
-    input_len: str = "1024"
-    output_len: str = "128"
+    num_prompts: str = ""
+    prompts_per_gpu: int = 1000
+    input_len: str = "1"
+    output_len: str = "256"
     request_rate: str = "inf"
     max_concurrency: str = ""
+    max_concurrency_per_gpu: str = ""
     max_model_len: str = ""
     result_root: Path = field(default_factory=default_result_root)
     server_start_timeout: int = 900
@@ -154,12 +166,28 @@ class SingleNodeBenchmarkConfig:
     profile_max_iterations: int = 20
     profile_with_stack: bool = False
     profile_layer_scopes: bool = False
-    disable_prefix_caching: bool = False
+    disable_prefix_caching: bool = True
     port_release_timeout: int = 60
 
     @property
     def gpu_count(self) -> int:
         return len(self.gpu_ids)
+
+    def num_prompts_for_gpu_count(self, gpu_count: int) -> str:
+        if self.num_prompts:
+            explicit_num_prompts = int(self.num_prompts)
+            if explicit_num_prompts > 0:
+                return str(explicit_num_prompts)
+        return str(self.prompts_per_gpu * gpu_count)
+
+    def max_concurrency_for_gpu_count(self, gpu_count: int) -> str:
+        if self.max_concurrency:
+            return self.max_concurrency
+        if self.max_concurrency_per_gpu:
+            per_gpu = int(self.max_concurrency_per_gpu)
+            if per_gpu > 0:
+                return str(per_gpu * gpu_count)
+        return ""
 
 
 class SingleNodeBenchmarkRunner:
@@ -288,14 +316,23 @@ class SingleNodeBenchmarkRunner:
         metadata: dict[str, object] | None = None,
     ) -> list[str]:
         metadata = metadata or {}
+        num_prompts = self.config.num_prompts_for_gpu_count(gpu_count)
         metadata_args = [
             f"case={case_name}",
             f"model={self.config.model}",
             f"gpu_count={gpu_count}",
+            f"num_prompts={num_prompts}",
+            f"prompts_per_gpu={self.config.prompts_per_gpu}",
             f"input_len={self.config.input_len}",
             f"output_len={self.config.output_len}",
             f"profile_modules={self.config.profile_modules}",
         ]
+        max_concurrency = self.config.max_concurrency_for_gpu_count(gpu_count)
+        if max_concurrency:
+            metadata_args.append(f"max_concurrency={max_concurrency}")
+        if self.config.max_concurrency_per_gpu:
+            metadata_args.append(
+                f"max_concurrency_per_gpu={self.config.max_concurrency_per_gpu}")
         metadata_args.extend(f"{key}={value}" for key, value in metadata.items())
 
         cmd = [
@@ -321,7 +358,7 @@ class SingleNodeBenchmarkRunner:
             "--output-len",
             self.config.output_len,
             "--num-prompts",
-            self.config.num_prompts,
+            num_prompts,
             "--request-rate",
             self.config.request_rate,
             "--save-result",
@@ -333,8 +370,8 @@ class SingleNodeBenchmarkRunner:
             *metadata_args,
             *self.config.bench_extra_args,
         ]
-        if self.config.max_concurrency:
-            cmd.extend(["--max-concurrency", self.config.max_concurrency])
+        if max_concurrency:
+            cmd.extend(["--max-concurrency", max_concurrency])
         if self.config.profile_modules:
             cmd.append("--profile")
         return cmd
@@ -477,7 +514,3 @@ class SingleNodeBenchmarkRunner:
             writer.writeheader()
             writer.writerows(rows)
         print(f"Module summary: {summary_path}")
-
-
-def shlex_env(name: str, default: str = "") -> list[str]:
-    return shlex.split(env(name, default))

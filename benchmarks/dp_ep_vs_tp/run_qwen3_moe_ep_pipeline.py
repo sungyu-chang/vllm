@@ -20,6 +20,7 @@ from single_node_common import (
     env_bool,
     shlex_env,
     validate_sizes,
+    with_default_flag,
 )
 
 CASE_RE = re.compile(r"^dp(?P<gpu_count>\d+)_ep$")
@@ -68,8 +69,8 @@ def make_config(
     profile_modules: bool,
     base_port: int,
 ) -> SingleNodeBenchmarkConfig:
-    bench_extra_args = ["--ignore-eos"]
-    bench_extra_args.extend(shlex_env("BENCH_EXTRA_ARGS"))
+    bench_extra_args = with_default_flag(shlex_env("BENCH_EXTRA_ARGS"),
+                                         "--ignore-eos")
 
     return SingleNodeBenchmarkConfig(
         model=env("MODEL", "Qwen/Qwen3-30B-A3B"),
@@ -77,7 +78,8 @@ def make_config(
         host=env("HOST", "127.0.0.1"),
         base_port=base_port,
         gpu_ids=gpu_ids,
-        num_prompts="0",
+        num_prompts=env("NUM_PROMPTS", ""),
+        prompts_per_gpu=int(env("PROMPTS_PER_GPU", "1000")),
         input_len=env("INPUT_LEN", "1"),
         output_len=env("OUTPUT_LEN", "256"),
         request_rate=env("REQUEST_RATE", "inf"),
@@ -95,10 +97,6 @@ def make_config(
         profile_layer_scopes=env_bool("PROFILE_LAYER_SCOPES", True),
         disable_prefix_caching=True,
     )
-
-
-def num_prompts_for_dp_size(dp_size: int) -> str:
-    return str(dp_size * 1000)
 
 
 def run_dp_ep_matrix(
@@ -122,7 +120,6 @@ def run_dp_ep_matrix(
 
     try:
         for index, dp_size in enumerate(dp_sizes):
-            config.num_prompts = num_prompts_for_dp_size(dp_size)
             runner.run_case(
                 case_name=f"dp{dp_size}_ep",
                 gpu_count=dp_size,
@@ -277,7 +274,7 @@ def main() -> int:
     print(
         "Qwen3-MoE DP+EP pipeline: "
         f"GPU_IDS={gpu_ids}, DP_SIZES={dp_sizes}, "
-        "NUM_PROMPTS_PER_CASE=DP_SIZE*1000",
+        f"NUM_PROMPTS_PER_CASE=DP_SIZE*{env('PROMPTS_PER_GPU', '1000')}",
         flush=True,
     )
     print(
