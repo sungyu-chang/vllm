@@ -12,7 +12,7 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
-from matplotlib_plots import save_series_panels
+from matplotlib_plots import save_line_plot, save_series_panels
 
 
 SeriesMap = dict[str, list[tuple[int, float]]]
@@ -108,6 +108,28 @@ def load_rows(summary_paths: list[Path]) -> ModelMap:
 
 
 def render_png(title: str, model_series: ModelMap, output_path: Path) -> None:
+    if len(model_series) == 1:
+        series_map = next(iter(model_series.values()))
+        if len(series_map) == 1:
+            series_name, points = next(iter(series_map.items()))
+            x_values = [gpu_count for gpu_count, _ in points]
+            y_values = [throughput for _, throughput in points]
+            x_label = "Number of GPUs"
+            if series_name == "DP+EP":
+                x_label = "Number of GPUs (DP+EP size)"
+            elif series_name == "TP":
+                x_label = "Number of GPUs (TP size)"
+            save_line_plot(
+                output_path,
+                x_values,
+                y_values,
+                title=title,
+                x_label=x_label,
+                y_label="total token throughput",
+                color="#1f5f5b",
+            )
+            return
+
     save_series_panels(
         output_path,
         title=title,

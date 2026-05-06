@@ -31,6 +31,14 @@ MODULE_LABELS = {
 }
 
 
+def skip_optional_plot(exc: SystemExit) -> bool:
+    message = str(exc)
+    if "matplotlib is required for benchmark figures" not in message:
+        return False
+    print(f"Skipping optional plot generation: {message}", flush=True)
+    return True
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as file:
         return list(csv.DictReader(file))
@@ -85,6 +93,7 @@ def make_config(
         output_len=env("OUTPUT_LEN", "256"),
         request_rate=env("REQUEST_RATE", "inf"),
         max_concurrency=env("MAX_CONCURRENCY", ""),
+        max_concurrency_per_gpu=env("MAX_CONCURRENCY_PER_GPU", ""),
         max_model_len=env("MAX_MODEL_LEN", ""),
         result_root=result_root,
         server_start_timeout=int(env("SERVER_START_TIMEOUT", "900")),
@@ -302,10 +311,14 @@ def main() -> int:
             profile_modules=False,
             base_port=int(env("BASE_PORT", "8100")),
         )
-        plot_throughput(
-            throughput_root / "summary.csv",
-            result_root / "qwen3_moe_dp_ep_throughput.png",
-        )
+        try:
+            plot_throughput(
+                throughput_root / "summary.csv",
+                result_root / "qwen3_moe_dp_ep_throughput.png",
+            )
+        except SystemExit as exc:
+            if not skip_optional_plot(exc):
+                raise
 
     if run_profile:
         run_dp_ep_matrix(
@@ -316,11 +329,15 @@ def main() -> int:
             base_port=int(env("PROFILE_BASE_PORT", env("BASE_PORT", "8100"))),
         )
         write_profile_breakdowns(profile_root)
-        plot_module_latency(
-            profile_root / "module_summary.csv",
-            profile_root / "summary.csv",
-            result_root / "qwen3_moe_module_latency_stacked.png",
-        )
+        try:
+            plot_module_latency(
+                profile_root / "module_summary.csv",
+                profile_root / "summary.csv",
+                result_root / "qwen3_moe_module_latency_stacked.png",
+            )
+        except SystemExit as exc:
+            if not skip_optional_plot(exc):
+                raise
 
     print(f"Results: {result_root}")
     return 0
