@@ -1,15 +1,13 @@
-# One-node TP vs DP+EP Online Benchmark
+# DP+EP vs TP Online Benchmarks
 
-This folder contains a small harness for comparing online serving throughput on
-one GPU node:
+This directory contains online serving benchmark harnesses for comparing tensor
+parallelism (TP) against data parallelism plus expert parallelism (DP+EP). The
+main experiments are:
 
-- TP baselines: powers of two up to the detected GPU count
-- DP+EP cases: `DP=1..GPU_COUNT`, `TP=1`, `--enable-expert-parallel`
+1. Single-node Qwen MoE experiments.
+2. Two-node Ray TP1x2 vs DP+EP experiments.
 
-For example, a 4-GPU node runs `TP=1,2,4` and `DP+EP=1..4`. An
-8-GPU node runs `TP=1,2,4,8` and `DP+EP=1..8`.
-
-Use this only for MoE models when interpreting EP results. For dense models,
+Use these EP comparisons for MoE models. For dense models,
 `--enable-expert-parallel` does not create useful expert sharding.
 
 ## Online vs Offline Benchmarks
@@ -18,111 +16,19 @@ Use this only for MoE models when interpreting EP results. For dense models,
 benchmark process and measures batch inference throughput without the OpenAI API
 server, frontend request routing, DP load balancing, or HTTP overhead.
 
-Use `vllm bench serve` for online throughput. It sends requests to a running
+Use `vllm bench serve` for these experiments. It sends requests to a running
 `vllm serve` endpoint and reports request throughput, output-token throughput,
 total-token throughput, TTFT, TPOT, and E2E latency.
 
-## Quick Start
+## Setup
 
-From the repo root, after setting up the vLLM environment:
-
-```bash
-PATH="$(pwd)/.venv/bin:$PATH" \
-MODEL=deepseek-ai/DeepSeek-V2-Lite \
-SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
-```
-
-For the one-node TP vs DP+EP online benchmark requested in this repo on an
-8-GPU node with `input_len=1`, `output_len=256`, `--ignore-eos`, prefix
-caching disabled, and per-case prompts set to `1000 * GPUs used`:
+Run commands from the repo root after setting up the vLLM environment. Use the
+repo virtual environment on `PATH` so the benchmark subprocesses use the same
+installation:
 
 ```bash
-PATH="$(pwd)/.venv/bin:$PATH" \
-MODEL=Qwen/Qwen1.5-MoE-A2.7B \
-SERVER_EXTRA_ARGS="--dtype bfloat16" \
-GPU_COUNT=8 \
-TP_SIZES="1 2 4 8" \
-DP_SIZES="1 2 4 8" \
-REQUEST_RATE=inf \
-RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen1.5-MoE-A2.7B, input 1, output 256" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
+PATH="$(pwd)/.venv/bin:$PATH"
 ```
-
-For the expanded one-node DP+EP sweep requested for Qwen MoE models, use the
-suite wrapper. By default, it detects the visible GPU count, runs `DP+EP=1..N`,
-uses `input_len=1`, `output_len=256`, `--ignore-eos`, disables prefix caching,
-sets each case's prompt count to `1000 * GPUs used`, and skips TP baselines. It
-runs the Qwen1.5 MoE and Qwen3 MoE 30B experiments as separate run directories
-and then generates a combined CSV, Markdown summary, and PNG figure without
-manual polling:
-
-```bash
-PATH="$(pwd)/.venv/bin:$PATH" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py
-```
-
-To include TP baselines as well, pass `--include-tp`. TP sizes default to powers
-of two up to the detected GPU count, or can be overridden explicitly:
-
-```bash
-PATH="$(pwd)/.venv/bin:$PATH" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py \
-  --include-tp \
-  --tp-sizes "1 2 4"
-```
-
-Artifacts from the analysis step are written under:
-
-```text
-results/dp_ep_vs_tp/analysis/<timestamp>/
-```
-
-```bash
-PATH="$(pwd)/.venv/bin:$PATH" \
-MODEL=Qwen/Qwen3-30B-A3B \
-SERVER_EXTRA_ARGS="--dtype bfloat16" \
-GPU_COUNT=8 \
-TP_SIZES="1 2 4 8" \
-DP_SIZES="1 2 4 8" \
-REQUEST_RATE=inf \
-RUN_NOTES="Single-node TP vs DP+EP comparison for Qwen3-30B-A3B, input 1, output 256" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
-```
-
-For a two-node Ray cluster with one GPU per node, compare `TP=1 x 2` against
-`DP=2 + EP` from the Ray head node:
-
-```bash
-VLLM_RAY_DP_PACK_STRATEGY=strict \
-MODEL=allenai/OLMoE-1B-7B-0924-Instruct \
-SERVER_EXTRA_ARGS="--dtype float16" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py
-```
-
-The `tp1x2` case is one Ray-DP vLLM deployment with `DP=2`, `TP=1`, and EP
-disabled. For MoE models, vLLM's default behavior shards MoE expert layers as
-tensor parallel over `DP x TP`; this is not the same as two fully independent
-HTTP servers behind an external load balancer.
-
-The script creates a timestamped result directory under:
-
-```text
-results/dp_ep_vs_tp/one_node_online/
-results/dp_ep_vs_tp/two_node_ray/
-```
-
-Each case gets:
-
-- `server_logs/<case>.log`
-- `bench_logs/<case>.log`
-- `json/<case>.json`
-- `summary.csv`
-- `README.md`
-
-Every run directory now includes a `README.md` with the experiment setup,
-planned cases, artifact locations, run notes, fix notes, and failure details if
-the run aborts.
 
 Figure generation uses matplotlib and writes PNG files. Install the benchmark
 extra before running plot-producing scripts:
@@ -131,32 +37,216 @@ extra before running plot-producing scripts:
 uv pip install -e ".[bench]"
 ```
 
-## Module Timing Profile
+## Experiment 1: Single-Node Qwen Experiments
 
-The normal benchmark run reports online serving throughput and latency only. To
-collect averaged server-side module timings for attention and FusedMoE, enable
-the profiling pass:
+The single-node Qwen experiments are split into three cases:
+
+1. TP vs DP+EP comparison.
+2. DP+EP performance comparison.
+3. DP+EP performance comparison with module profiling.
+
+### Shared Single-Node Settings
+
+Use the same serving and client settings across the three cases:
+
+- Node shape: 8 GPUs.
+- Models: `Qwen/Qwen1.5-MoE-A2.7B` and `Qwen/Qwen3-30B-A3B` for TP vs DP+EP;
+  `Qwen/Qwen3-30B-A3B` for the DP+EP pipeline.
+- Server dtype: `--dtype bfloat16`.
+- Input length: `1`.
+- Output length: `256`.
+- Request rate: `inf`.
+- Benchmark args: `--ignore-eos`.
+- Prefix caching: disabled with `--no-enable-prefix-caching`.
+- All2all backend: `allgather_reducescatter`.
+- DP+EP sweep: `1..8`.
+- TP sweep: `1 2 4 8` for the TP baselines.
+- Request count: `1000 * GPUs used`.
+- Max client concurrency: larger than the request count for every case. For an
+  8-GPU node, use `MAX_CONCURRENCY_PER_GPU=1001` or `MAX_CONCURRENCY=10000`.
+
+With the default `PROMPTS_PER_GPU=1000`, `dp1_ep` uses 1000 requests and
+`dp8_ep` uses 8000 requests. TP baselines follow the same rule: `tp1` uses
+1000 requests and `tp8` uses 8000 requests.
+
+If `GPU_COUNT` is unset, the scripts first honor `CUDA_VISIBLE_DEVICES`, then
+fall back to `nvidia-smi -L`. If both `CUDA_VISIBLE_DEVICES` and `GPU_COUNT`
+are set, the scripts use the first `GPU_COUNT` entries from
+`CUDA_VISIBLE_DEVICES`.
+
+### Case 1: TP vs DP+EP
+
+This case compares TP baselines against DP+EP on the same single node. The Qwen
+suite runs Qwen1.5 MoE and Qwen3 MoE as separate run directories, then
+generates combined analysis artifacts:
 
 ```bash
-PROFILE_MODULES=1 \
-MODEL=deepseek-ai/DeepSeek-V2-Lite \
-SERVER_EXTRA_ARGS="--trust-remote-code --dtype bfloat16" \
-.venv/bin/python benchmarks/dp_ep_vs_tp/run_online_tp_vs_dp_ep.py
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py \
+  --include-tp \
+  --gpu-count 8 \
+  --tp-sizes "1 2 4 8" \
+  --dp-sizes "1 2 3 4 5 6 7 8" \
+  --input-len 1 \
+  --output-len 256 \
+  --max-concurrency-per-gpu 1001 \
+  --all2all-backend allgather_reducescatter
 ```
 
-or use:
+To run only one model preset:
 
 ```bash
-just dp-ep-vs-tp-profile-modules
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen_one_node_suite.py \
+  --models qwen3 \
+  --include-tp \
+  --gpu-count 8 \
+  --tp-sizes "1 2 4 8" \
+  --dp-sizes "1 2 3 4 5 6 7 8" \
+  --input-len 1 \
+  --output-len 256 \
+  --max-concurrency-per-gpu 1001 \
+  --all2all-backend allgather_reducescatter
 ```
 
-This starts `vllm serve` with the torch profiler, asks `vllm bench serve` to
-call `/start_profile` and `/stop_profile`, and enables custom profiler scopes
-inside the attention and FusedMoE module boundaries. Each case writes profiler
-artifacts under:
+The suite writes one run directory per model under:
 
 ```text
-benchmarks/dp_ep_vs_tp/results/<run>/profiler_traces/<case>/
+results/dp_ep_vs_tp/one_node_online/<timestamp>/
+```
+
+The combined analysis artifacts are written under:
+
+```text
+results/dp_ep_vs_tp/analysis/<timestamp>/
+```
+
+Each model run contains:
+
+- `server_logs/<case>.log`
+- `bench_logs/<case>.log`
+- `json/<case>.json`
+- `summary.csv`
+- `README.md`
+
+### Case 2: DP+EP Performance
+
+This case runs the clean Qwen3 DP+EP throughput sweep without torch profiling.
+It uses `DP+EP=1..8`, `INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, disabled
+prefix caching, and per-case request counts of `DP_SIZE * 1000`.
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+RUN_PROFILE=0 \
+MODEL=Qwen/Qwen3-30B-A3B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+DP_SIZES="1 2 3 4 5 6 7 8" \
+PROMPTS_PER_GPU=1000 \
+INPUT_LEN=1 \
+OUTPUT_LEN=256 \
+REQUEST_RATE=inf \
+MAX_CONCURRENCY_PER_GPU=1001 \
+ALL2ALL_BACKEND=allgather_reducescatter \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_pipeline.py
+```
+
+The clean run writes:
+
+- `throughput/summary.csv`
+- `throughput/json/<case>.json`
+- `throughput/server_logs/<case>.log`
+- `throughput/bench_logs/<case>.log`
+- `qwen3_moe_dp_ep_throughput.png`
+
+### Case 3: DP+EP Performance With Profiling
+
+This case repeats the DP+EP sweep with module profiling enabled. Use it to
+inspect attention, FusedMoE, and MoE communication timing. Do not mix these
+numbers with clean throughput comparisons, because torch profiling and custom
+scopes add overhead.
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+RUN_THROUGHPUT=0 \
+RUN_PROFILE=1 \
+MODEL=Qwen/Qwen3-30B-A3B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+DP_SIZES="1 2 3 4 5 6 7 8" \
+PROMPTS_PER_GPU=1000 \
+INPUT_LEN=1 \
+OUTPUT_LEN=256 \
+REQUEST_RATE=inf \
+MAX_CONCURRENCY_PER_GPU=1001 \
+ALL2ALL_BACKEND=allgather_reducescatter \
+PROFILE_LAYER_SCOPES=1 \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_pipeline.py
+```
+
+The profiled run writes:
+
+- `profile/summary.csv`
+- `profile/module_summary.csv`
+- `profile/per_layer_module_summary.csv`
+- `profile/moe_comm_summary.csv`
+- `profile/profiler_traces/<case>/`
+- `qwen3_moe_module_latency_stacked.png`
+
+Every run directory includes a `README.md` with the experiment setup, planned
+cases, artifact locations, run notes, fix notes, and failure details if the run
+aborts.
+
+## Experiment 2: Two-Node Ray TP1x2 vs DP+EP
+
+The two-node script assumes a Ray cluster is already running across two nodes
+with one GPU per node, and that the command is launched from the Ray head node.
+It compares:
+
+- `tp1x2`: one Ray-DP vLLM deployment with `DP=2`, `TP=1`, and EP disabled.
+- `dp2_ep`: the same Ray-DP shape with `--enable-expert-parallel`.
+
+Run:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+VLLM_RAY_DP_PACK_STRATEGY=strict \
+MODEL=allenai/OLMoE-1B-7B-0924-Instruct \
+SERVER_EXTRA_ARGS="--dtype float16" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py
+```
+
+The script writes results under:
+
+```text
+results/dp_ep_vs_tp/two_node_ray/<timestamp>/
+```
+
+Each two-node run contains:
+
+- `server_logs/<case>.log`
+- `bench_logs/<case>.log`
+- `json/<case>.json`
+- `summary.csv`
+- `README.md`
+
+For MoE models, vLLM's default behavior shards MoE expert layers as tensor
+parallel over `DP x TP`; this is not the same as two fully independent HTTP
+servers behind an external load balancer.
+
+`VLLM_RAY_DP_PACK_STRATEGY` defaults to `strict` for this script. On the
+current DP placement logic, a two-node one-GPU-per-node cluster cannot use
+`span`; use `strict` for this topology.
+
+## Module Timing Profile Details
+
+The profiled single-node case starts `vllm serve` with the torch profiler, asks
+`vllm bench serve` to call `/start_profile` and `/stop_profile`, and enables
+custom profiler scopes inside the attention and FusedMoE module boundaries.
+Each profiled case writes profiler artifacts under:
+
+```text
+<run-root>/profile/profiler_traces/<case>/
 ```
 
 The most directly useful file is `module_profiler_out_<rank>.txt`, which
@@ -188,39 +278,9 @@ add overhead. By default, the script skips the first 5 engine iterations and
 profiles 20 iterations. Override with `PROFILE_DELAY_ITERATIONS` and
 `PROFILE_MAX_ITERATIONS`.
 
-## Qwen3-MoE DP+EP Pipeline
-
-Run the all-in-one single-node Qwen3-MoE DP+EP pipeline with:
-
-```bash
-just qwen3-moe-ep-pipeline
-```
-
-By default, it uses `Qwen/Qwen3-30B-A3B`, runs `DP+EP=1..GPU_COUNT`, uses
-`INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, and sets each case's prompt
-count to `1000 * GPUs used`. It runs two passes:
-
-- `throughput/`: clean online throughput run without torch profiling
-- `profile/`: same benchmark shape with module profiling enabled
-
-Pipeline outputs at the run root:
-
-- `qwen3_moe_dp_ep_throughput.png`: number of GPUs vs total token throughput
-- `qwen3_moe_module_latency_stacked.png`: stacked attention/FusedMoE average
-  CUDA latency
-- `profile/per_layer_module_summary.csv`: per-layer attention and FusedMoE
-  latency rows when layer scopes are enabled
-- `profile/moe_comm_summary.csv`: MoE communication rows for the profiled run
-
-This pipeline always passes `--ignore-eos` to the benchmark command and
-`--no-enable-prefix-caching` to the server command. The prefix-cache flag
-disables prefix-cache reuse, not the KV cache itself. vLLM serving still uses KV
-cache for autoregressive decode; there is no normal serving flag that disables
-KV cache while preserving efficient generation.
-
 ## Common Knobs
 
-Configure by environment variables:
+Configure runs with environment variables:
 
 ```bash
 MODEL=deepseek-ai/DeepSeek-V2-Lite
@@ -246,18 +306,14 @@ SMOKE_RUN=0
 RUN_NOTES=
 FIX_NOTES=
 PROFILE_MODULES=0
+RUN_THROUGHPUT=1
+RUN_PROFILE=1
 PROFILE_DELAY_ITERATIONS=5
 PROFILE_MAX_ITERATIONS=20
 PROFILE_WITH_STACK=0
 PROFILE_LAYER_SCOPES=0
 DISABLE_PREFIX_CACHING=1
 ```
-
-`GPU_COUNT` is optional. If it is unset, the script first honors
-`CUDA_VISIBLE_DEVICES`, then falls back to `nvidia-smi -L`. If both
-`CUDA_VISIBLE_DEVICES` and `GPU_COUNT` are set, the script uses the first
-`GPU_COUNT` entries from `CUDA_VISIBLE_DEVICES`. Explicit `TP_SIZES` and
-`DP_SIZES` override the detected defaults.
 
 By default, every case uses `INPUT_LEN=1`, `OUTPUT_LEN=256`, appends
 `--ignore-eos` to `vllm bench serve`, and starts `vllm serve` with
@@ -266,10 +322,6 @@ uses `PROMPTS_PER_GPU * GPUs used`; the default `PROMPTS_PER_GPU` is `1000`.
 
 Leave `MAX_MODEL_LEN` empty to use vLLM's model-derived default context length.
 Set it only when you intentionally want to pass `--max-model-len`.
-
-For the two-node Ray script, `VLLM_RAY_DP_PACK_STRATEGY` defaults to `strict`.
-On the current DP placement logic, a two-node one-GPU-per-node cluster cannot
-use `span`; use `strict` for this topology.
 
 Set `SMOKE_RUN=1` to suffix the run folder name with `_smoke`.
 

@@ -13,6 +13,7 @@ from matplotlib_plots import save_line_plot, save_stacked_bar_plot
 from single_node_common import (
     SingleNodeBenchmarkConfig,
     SingleNodeBenchmarkRunner,
+    configured_sizes,
     default_dp_sizes,
     default_result_root,
     detect_gpu_ids,
@@ -262,8 +263,12 @@ def write_profile_breakdowns(profile_root: Path) -> None:
 def main() -> int:
     gpu_ids = detect_gpu_ids()
     gpu_count = len(gpu_ids)
-    dp_sizes = default_dp_sizes(gpu_count)
+    dp_sizes = configured_sizes("DP_SIZES", default_dp_sizes(gpu_count))
     validate_sizes("DP_SIZES", dp_sizes, gpu_count)
+    run_throughput = env_bool("RUN_THROUGHPUT", True)
+    run_profile = env_bool("RUN_PROFILE", True)
+    if not run_throughput and not run_profile:
+        raise SystemExit("At least one of RUN_THROUGHPUT or RUN_PROFILE must be 1.")
 
     result_root = Path(
         env("RESULT_ROOT", str(default_result_root("qwen3_moe_ep_pipeline")))
@@ -274,7 +279,8 @@ def main() -> int:
     print(
         "Qwen3-MoE DP+EP pipeline: "
         f"GPU_IDS={gpu_ids}, DP_SIZES={dp_sizes}, "
-        f"NUM_PROMPTS_PER_CASE=DP_SIZE*{env('PROMPTS_PER_GPU', '1000')}",
+        f"NUM_PROMPTS_PER_CASE=DP_SIZE*{env('PROMPTS_PER_GPU', '1000')}, "
+        f"RUN_THROUGHPUT={run_throughput}, RUN_PROFILE={run_profile}",
         flush=True,
     )
     print(
@@ -288,31 +294,33 @@ def main() -> int:
         flush=True,
     )
 
-    run_dp_ep_matrix(
-        result_root=throughput_root,
-        gpu_ids=gpu_ids,
-        dp_sizes=dp_sizes,
-        profile_modules=False,
-        base_port=int(env("BASE_PORT", "8100")),
-    )
-    plot_throughput(
-        throughput_root / "summary.csv",
-        result_root / "qwen3_moe_dp_ep_throughput.png",
-    )
+    if run_throughput:
+        run_dp_ep_matrix(
+            result_root=throughput_root,
+            gpu_ids=gpu_ids,
+            dp_sizes=dp_sizes,
+            profile_modules=False,
+            base_port=int(env("BASE_PORT", "8100")),
+        )
+        plot_throughput(
+            throughput_root / "summary.csv",
+            result_root / "qwen3_moe_dp_ep_throughput.png",
+        )
 
-    run_dp_ep_matrix(
-        result_root=profile_root,
-        gpu_ids=gpu_ids,
-        dp_sizes=dp_sizes,
-        profile_modules=True,
-        base_port=int(env("PROFILE_BASE_PORT", env("BASE_PORT", "8100"))),
-    )
-    write_profile_breakdowns(profile_root)
-    plot_module_latency(
-        profile_root / "module_summary.csv",
-        profile_root / "summary.csv",
-        result_root / "qwen3_moe_module_latency_stacked.png",
-    )
+    if run_profile:
+        run_dp_ep_matrix(
+            result_root=profile_root,
+            gpu_ids=gpu_ids,
+            dp_sizes=dp_sizes,
+            profile_modules=True,
+            base_port=int(env("PROFILE_BASE_PORT", env("BASE_PORT", "8100"))),
+        )
+        write_profile_breakdowns(profile_root)
+        plot_module_latency(
+            profile_root / "module_summary.csv",
+            profile_root / "summary.csv",
+            result_root / "qwen3_moe_module_latency_stacked.png",
+        )
 
     print(f"Results: {result_root}")
     return 0

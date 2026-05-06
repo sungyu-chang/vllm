@@ -64,12 +64,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tp-sizes",
         default=None,
-        help="Space-separated TP sizes. Defaults to powers of two when --include-tp is set.",
+        help=(
+            "Space-separated TP sizes. Defaults to powers of two when "
+            "--include-tp is set."
+        ),
     )
     parser.add_argument(
         "--dp-sizes",
         default=None,
-        help="Space-separated DP+EP sizes. Defaults to 1 through the detected GPU count.",
+        help=(
+            "Space-separated DP+EP sizes. Defaults to 1 through the detected "
+            "GPU count."
+        ),
     )
     parser.add_argument("--input-len", default="1")
     parser.add_argument("--output-len", default="256")
