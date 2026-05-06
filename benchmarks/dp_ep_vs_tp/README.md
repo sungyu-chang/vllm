@@ -39,15 +39,17 @@ uv pip install -e ".[bench]"
 
 ## Experiment 1: Single-Node Qwen Experiments
 
-The single-node Qwen experiments are split into three cases:
+The single-node Qwen experiments are split into four cases:
 
 1. TP vs DP+EP comparison.
 2. DP+EP performance comparison.
 3. DP+EP performance comparison with module profiling.
+4. Fixed-request DP+EP profiling for the anatomy stacked bar figure.
 
 ### Shared Single-Node Settings
 
-Use the same serving and client settings across the three cases:
+Use the same serving and client settings across the cases unless a case
+explicitly overrides one of these values:
 
 - Node shape: 8 GPUs.
 - Models: `Qwen/Qwen1.5-MoE-A2.7B` and `Qwen/Qwen3-30B-A3B` for TP vs DP+EP;
@@ -61,7 +63,8 @@ Use the same serving and client settings across the three cases:
 - All2all backend: `allgather_reducescatter`.
 - DP+EP sweep: `1..8`.
 - TP sweep: `1 2 4 8` for the TP baselines.
-- Request count: `1000 * GPUs used`.
+- Request count: `1000 * GPUs used`, except Case 4 which fixes every DP+EP
+  case to `NUM_PROMPTS=1000`.
 - Max client concurrency: larger than the request count for every case. For an
   8-GPU node, use `MAX_CONCURRENCY_PER_GPU=1001` or `MAX_CONCURRENCY=10000`.
 
@@ -185,6 +188,40 @@ PROFILE_LAYER_SCOPES=1 \
 ```
 
 The profiled run writes:
+
+- `profile/summary.csv`
+- `profile/module_summary.csv`
+- `profile/per_layer_module_summary.csv`
+- `profile/moe_comm_summary.csv`
+- `profile/profiler_traces/<case>/`
+- `qwen3_moe_module_latency_stacked.png`
+
+### Case 4: Fixed-Request DP+EP Anatomy Profiling
+
+This case keeps the same profiling settings as Case 3, but fixes each DP+EP
+case to 1000 requests. Use it when comparing the attention/FusedMoE anatomy
+stacked bar figure across DP+EP sizes without scaling the request count by the
+number of GPUs.
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+RUN_THROUGHPUT=0 \
+RUN_PROFILE=1 \
+MODEL=Qwen/Qwen3-30B-A3B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+DP_SIZES="1 2 3 4 5 6 7 8" \
+NUM_PROMPTS=1000 \
+INPUT_LEN=1 \
+OUTPUT_LEN=256 \
+REQUEST_RATE=inf \
+MAX_CONCURRENCY_PER_GPU=1001 \
+ALL2ALL_BACKEND=allgather_reducescatter \
+PROFILE_LAYER_SCOPES=1 \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_pipeline.py
+```
+
+The fixed-request profiled run writes:
 
 - `profile/summary.csv`
 - `profile/module_summary.csv`

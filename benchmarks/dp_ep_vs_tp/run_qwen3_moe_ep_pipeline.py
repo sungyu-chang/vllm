@@ -39,6 +39,13 @@ def skip_optional_plot(exc: SystemExit) -> bool:
     return True
 
 
+def prompt_count_description() -> str:
+    num_prompts = env("NUM_PROMPTS", "")
+    if num_prompts:
+        return f"NUM_PROMPTS_PER_CASE={num_prompts}"
+    return f"NUM_PROMPTS_PER_CASE=DP_SIZE*{env('PROMPTS_PER_GPU', '1000')}"
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as file:
         return list(csv.DictReader(file))
@@ -288,7 +295,7 @@ def main() -> int:
     print(
         "Qwen3-MoE DP+EP pipeline: "
         f"GPU_IDS={gpu_ids}, DP_SIZES={dp_sizes}, "
-        f"NUM_PROMPTS_PER_CASE=DP_SIZE*{env('PROMPTS_PER_GPU', '1000')}, "
+        f"{prompt_count_description()}, "
         f"RUN_THROUGHPUT={run_throughput}, RUN_PROFILE={run_profile}",
         flush=True,
     )
