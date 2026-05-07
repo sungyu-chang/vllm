@@ -62,7 +62,7 @@ explicitly overrides one of these values:
 - Benchmark args: `--ignore-eos`.
 - Prefix caching: disabled with `--no-enable-prefix-caching`.
 - All2all backend: `allgather_reducescatter`.
-- DP+EP sweep: `1..8`.
+- DP+EP sweep: defaults to `1..GPU_COUNT`.
 - TP sweep: `1 2 4 8` for the TP baselines.
 - Request count: `1000 * GPUs used`, except Case 4 which fixes every DP+EP
   case to `NUM_PROMPTS=1000`.
@@ -90,7 +90,6 @@ PATH="$(pwd)/.venv/bin:$PATH" \
   --include-tp \
   --gpu-count 8 \
   --tp-sizes "1 2 4 8" \
-  --dp-sizes "1 2 3 4 5 6 7 8" \
   --input-len 1 \
   --output-len 256 \
   --num-warmups 100 \
@@ -107,7 +106,6 @@ PATH="$(pwd)/.venv/bin:$PATH" \
   --include-tp \
   --gpu-count 8 \
   --tp-sizes "1 2 4 8" \
-  --dp-sizes "1 2 3 4 5 6 7 8" \
   --input-len 1 \
   --output-len 256 \
   --num-warmups 100 \
@@ -138,8 +136,9 @@ Each model run contains:
 ### Case 2: DP+EP Performance
 
 This case runs the clean Qwen3 DP+EP throughput sweep without torch profiling.
-It uses `DP+EP=1..8`, `INPUT_LEN=1`, `OUTPUT_LEN=256`, `--ignore-eos`, disabled
-prefix caching, and per-case request counts of `DP_SIZE * 1000`.
+With `GPU_COUNT=8`, the default DP+EP sweep is `1..8`. It uses `INPUT_LEN=1`,
+`OUTPUT_LEN=256`, `--ignore-eos`, disabled prefix caching, and per-case request
+counts of `DP_SIZE * 1000`.
 
 ```bash
 PATH="$(pwd)/.venv/bin:$PATH" \
@@ -147,7 +146,6 @@ RUN_PROFILE=0 \
 MODEL=Qwen/Qwen3-30B-A3B \
 SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
-DP_SIZES="1 2 3 4 5 6 7 8" \
 PROMPTS_PER_GPU=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
@@ -183,7 +181,6 @@ RUN_PROFILE=1 \
 MODEL=Qwen/Qwen3-30B-A3B \
 SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
-DP_SIZES="1 2 3 4 5 6 7 8" \
 PROMPTS_PER_GPU=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
@@ -223,7 +220,6 @@ RUN_PROFILE=1 \
 MODEL=Qwen/Qwen3-30B-A3B \
 SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
-DP_SIZES="1 2 3 4 5 6 7 8" \
 NUM_PROMPTS=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
@@ -244,7 +240,6 @@ RUN_PROFILE=1 \
 MODEL=Qwen/Qwen1.5-MoE-A2.7B \
 SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=4 \
-DP_SIZES="1 2 3 4" \
 NUM_PROMPTS=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
@@ -386,7 +381,6 @@ Configure runs with environment variables:
 MODEL=deepseek-ai/DeepSeek-V2-Lite
 GPU_COUNT=8
 TP_SIZES="1 2 4 8"
-DP_SIZES="1 2 3 4 5 6 7 8"
 NUM_PROMPTS=
 PROMPTS_PER_GPU=1000
 INPUT_LEN=1
@@ -421,6 +415,8 @@ By default, every case uses `INPUT_LEN=1`, `OUTPUT_LEN=256`,
 `vllm serve` with
 `--no-enable-prefix-caching`. Unless `NUM_PROMPTS` is set explicitly, each case
 uses `PROMPTS_PER_GPU * GPUs used`; the default `PROMPTS_PER_GPU` is `1000`.
+Leave `DP_SIZES` unset to sweep `1..GPU_COUNT`; set it only when you want a
+subset or a custom order.
 
 Leave `MAX_MODEL_LEN` empty to use vLLM's model-derived default context length.
 Set it only when you intentionally want to pass `--max-model-len`.
