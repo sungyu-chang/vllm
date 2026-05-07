@@ -203,6 +203,10 @@ case to 1000 requests. Use it when comparing the attention/FusedMoE anatomy
 stacked bar figure across DP+EP sizes without scaling the request count by the
 number of GPUs.
 
+The only request-shape difference from Case 3 is `NUM_PROMPTS=1000`, which
+overrides `PROMPTS_PER_GPU`. Keep `MAX_CONCURRENCY_PER_GPU=1001` so the client
+concurrency remains greater than the 1000 total requests for every DP+EP size.
+
 ```bash
 PATH="$(pwd)/.venv/bin:$PATH" \
 RUN_THROUGHPUT=0 \
@@ -211,6 +215,26 @@ MODEL=Qwen/Qwen3-30B-A3B \
 SERVER_EXTRA_ARGS="--dtype bfloat16" \
 GPU_COUNT=8 \
 DP_SIZES="1 2 3 4 5 6 7 8" \
+NUM_PROMPTS=1000 \
+INPUT_LEN=1 \
+OUTPUT_LEN=256 \
+REQUEST_RATE=inf \
+MAX_CONCURRENCY_PER_GPU=1001 \
+ALL2ALL_BACKEND=allgather_reducescatter \
+PROFILE_LAYER_SCOPES=1 \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_pipeline.py
+```
+
+For Qwen1.5-MoE on a 4-GPU single node:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+RUN_THROUGHPUT=0 \
+RUN_PROFILE=1 \
+MODEL=Qwen/Qwen1.5-MoE-A2.7B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=4 \
+DP_SIZES="1 2 3 4" \
 NUM_PROMPTS=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
