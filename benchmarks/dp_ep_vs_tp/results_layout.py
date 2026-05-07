@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOP_LEVEL_RESULTS_DIR = REPO_ROOT / "results"
+BENCHMARK_NAME = "dp_ep_vs_tp"
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -22,15 +23,11 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def build_result_root(benchmark_name: str, run_group: str) -> Path:
-    explicit_root = os.environ.get("RESULT_ROOT")
-    if explicit_root:
-        return Path(explicit_root)
-
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+def build_result_root(run_group: str) -> Path:
+    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if env_flag("SMOKE_RUN"):
         run_name = f"{run_name}_smoke"
-    return TOP_LEVEL_RESULTS_DIR / benchmark_name / run_group / run_name
+    return TOP_LEVEL_RESULTS_DIR / BENCHMARK_NAME / run_group / run_name
 
 
 def _format_notes(raw_notes: str | None) -> list[str]:

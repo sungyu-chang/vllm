@@ -16,10 +16,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+
+try:
+    from results_layout import build_result_root
+except ModuleNotFoundError:
+    from benchmarks.dp_ep_vs_tp.results_layout import build_result_root
 
 
 def env(name: str, default: str) -> str:
@@ -134,11 +138,8 @@ def validate_sizes(name: str, sizes: list[int], gpu_count: int) -> None:
         )
 
 
-def default_result_root(name: str = "") -> Path:
-    run_name = f"{datetime.now():%Y%m%d_%H%M%S}"
-    if name:
-        run_name = f"{run_name}_{name}"
-    return Path("benchmarks/dp_ep_vs_tp/results") / run_name
+def default_result_root(name: str = "one_node_online") -> Path:
+    return build_result_root(name or "one_node_online")
 
 
 @dataclass
@@ -337,6 +338,11 @@ class SingleNodeBenchmarkRunner:
         if self.config.disable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
         cmd.extend(server_args)
+        if (
+            self.config.profile_modules
+            and "--enforce-eager" not in self.config.server_extra_args
+        ):
+            cmd.append("--enforce-eager")
         cmd.extend(self.config.server_extra_args)
         return cmd
 
@@ -487,9 +493,9 @@ class SingleNodeBenchmarkRunner:
         )
         print(f"Summary: {summary_path}")
 
-    def summarize_module_profiles(self) -> None:
+    def summarize_module_profiles(self) -> Path | None:
         if not self.profile_dir.is_dir():
-            return
+            return None
 
         rows: list[dict[str, str]] = []
         totals: dict[tuple[str, str], dict[str, float]] = {}
@@ -532,7 +538,11 @@ class SingleNodeBenchmarkRunner:
             )
 
         if not rows:
-            return
+            print(
+                "Skipping module summary: no module_profiler_out_*.txt files "
+                f"found under {self.profile_dir}."
+            )
+            return None
 
         summary_path = self.config.result_root / "module_summary.csv"
         fieldnames = [
@@ -550,3 +560,4 @@ class SingleNodeBenchmarkRunner:
             writer.writeheader()
             writer.writerows(rows)
         print(f"Module summary: {summary_path}")
+        return summary_path

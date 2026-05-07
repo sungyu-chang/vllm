@@ -117,11 +117,15 @@ PATH="$(pwd)/.venv/bin:$PATH" \
 
 The suite writes one run directory per model under:
 
-The results are written under the root repo directory.
 ```text
-results/dp_ep_vs_tp/one_node_online/<timestamp>/
+results/dp_ep_vs_tp/one_node_online/YYYY-MM-DD_HH-MM-SS/
 ```
 
+The combined analysis artifacts are written under:
+
+```text
+results/dp_ep_vs_tp/analysis/YYYY-MM-DD_HH-MM-SS/
+```
 
 Each model run contains:
 
@@ -156,11 +160,14 @@ ALL2ALL_BACKEND=allgather_reducescatter \
 
 The clean run writes:
 
+```text
+results/dp_ep_vs_tp/qwen3_moe_ep_pipeline/YYYY-MM-DD_HH-MM-SS/
+```
+
 - `throughput/summary.csv`
 - `throughput/json/<case>.json`
 - `throughput/server_logs/<case>.log`
 - `throughput/bench_logs/<case>.log`
-- `qwen3_moe_dp_ep_throughput.png`
 
 ### Case 3: DP+EP Performance With Profiling
 
@@ -190,19 +197,20 @@ PROFILE_LAYER_SCOPES=1 \
 
 The profiled run writes:
 
+```text
+results/dp_ep_vs_tp/qwen3_moe_ep_pipeline/YYYY-MM-DD_HH-MM-SS/
+```
+
 - `profile/summary.csv`
 - `profile/module_summary.csv`
-- `profile/per_layer_module_summary.csv`
-- `profile/moe_comm_summary.csv`
 - `profile/profiler_traces/<case>/`
-- `qwen3_moe_module_latency_stacked.png`
 
 ### Case 4: Fixed-Request DP+EP Anatomy Profiling
 
 This case keeps the same profiling settings as Case 3, but fixes each DP+EP
-case to 1000 requests. Use it when comparing the attention/FusedMoE anatomy
-stacked bar figure across DP+EP sizes without scaling the request count by the
-number of GPUs.
+case to 1000 requests. Use it when comparing the attention, expert computation,
+and MoE communication latency anatomy stacked bar figure across DP+EP sizes
+without scaling the request count by the number of GPUs.
 
 The only request-shape difference from Case 3 is `NUM_PROMPTS=1000`, which
 overrides `PROMPTS_PER_GPU`. Keep `MAX_CONCURRENCY_PER_GPU=1001` so the client
@@ -248,14 +256,41 @@ PROFILE_LAYER_SCOPES=1 \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_pipeline.py
 ```
 
-The fixed-request profiled run writes:
+The fixed-request profiled run writes benchmark artifacts under the generated
+result directory:
 
 - `profile/summary.csv`
 - `profile/module_summary.csv`
+- `profile/profiler_traces/<case>/`
+
+To render or rerender Qwen3 DP+EP plots from an existing result directory, pass
+the result directory as a positional argument to the dedicated plotting script:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/plot_qwen3_moe_ep_pipeline.py \
+  results/dp_ep_vs_tp/qwen3_moe_ep_pipeline/YYYY-MM-DD_HH-MM-SS
+```
+
+The Qwen plotting script writes or rewrites:
+
+- `qwen3_moe_dp_ep_throughput.png`
+- `qwen3_moe_module_latency_stacked.png`
 - `profile/per_layer_module_summary.csv`
 - `profile/moe_comm_summary.csv`
-- `profile/profiler_traces/<case>/`
-- `qwen3_moe_module_latency_stacked.png`
+
+The module latency figure breaks the aggregate FusedMoE latency into expert
+computation latency and MoE communication latency.
+
+To rerender the TP vs DP+EP throughput figure from existing one-node run
+directories, use the standalone plotting script:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+.venv/bin/python benchmarks/dp_ep_vs_tp/plot_total_token_throughput.py \
+  results/dp_ep_vs_tp/one_node_online/YYYY-MM-DD_HH-MM-SS \
+  --output results/dp_ep_vs_tp/analysis/YYYY-MM-DD_HH-MM-SS/total_token_throughput.png
+```
 
 Every run directory includes a `README.md` with the experiment setup, planned
 cases, artifact locations, run notes, fix notes, and failure details if the run
@@ -284,7 +319,7 @@ SERVER_EXTRA_ARGS="--dtype float16" \
 The script writes results under:
 
 ```text
-results/dp_ep_vs_tp/two_node_ray/<timestamp>/
+results/dp_ep_vs_tp/two_node_ray/YYYY-MM-DD_HH-MM-SS/
 ```
 
 Each two-node run contains:

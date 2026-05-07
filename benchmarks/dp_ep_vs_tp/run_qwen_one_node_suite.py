@@ -14,13 +14,12 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
+from results_layout import build_result_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_ROOT = REPO_ROOT / "results" / "dp_ep_vs_tp" / "one_node_online"
-ANALYSIS_ROOT = REPO_ROOT / "results" / "dp_ep_vs_tp" / "analysis"
 
 
 @dataclass(frozen=True)
@@ -185,7 +184,7 @@ def run_model(spec: ModelSpec, args: argparse.Namespace) -> Path:
 
 
 def analyze_runs(run_dirs: list[Path]) -> Path:
-    analysis_dir = ANALYSIS_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
+    analysis_dir = build_result_root("analysis")
     subprocess.run(
         [
             sys.executable,

@@ -44,7 +44,7 @@ def build_config(gpu_ids: list[str]) -> SingleNodeBenchmarkConfig:
         max_concurrency=env("MAX_CONCURRENCY", ""),
         max_concurrency_per_gpu=env("MAX_CONCURRENCY_PER_GPU", ""),
         max_model_len=env("MAX_MODEL_LEN", ""),
-        result_root=build_result_root("dp_ep_vs_tp", "one_node_online"),
+        result_root=build_result_root("one_node_online"),
         server_start_timeout=int(env("SERVER_START_TIMEOUT", "900")),
         server_extra_args=shlex_env("SERVER_EXTRA_ARGS"),
         bench_extra_args=with_default_flag(

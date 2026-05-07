@@ -15,12 +15,11 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
+from results_layout import build_result_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RESULTS_ROOT = REPO_ROOT / "results" / "dp_ep_vs_tp"
 
 
 @dataclass(frozen=True)
@@ -51,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Output directory for combined CSV, Markdown summary, and PNG. "
-            "Defaults to results/dp_ep_vs_tp/analysis/<timestamp>."
+            "Defaults to results/dp_ep_vs_tp/analysis/YYYY-MM-DD_HH-MM-SS."
         ),
     )
     parser.add_argument(
@@ -104,8 +103,7 @@ def load_rows(run_dirs: list[Path]) -> list[Row]:
 
 
 def default_output_dir() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return RESULTS_ROOT / "analysis" / timestamp
+    return build_result_root("analysis")
 
 
 def write_combined_csv(output_path: Path, rows: list[Row]) -> None:

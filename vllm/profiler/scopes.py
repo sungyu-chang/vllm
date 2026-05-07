@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Optional profiler scopes for coarse model-module timing."""
-
-import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 
+import torch
 from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
@@ -15,10 +14,6 @@ _CURRENT_MOE_LAYER: ContextVar[str | None] = ContextVar(
     "current_moe_layer",
     default=None,
 )
-
-
-def _env_enabled(name: str) -> bool:
-    return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 @contextmanager
@@ -33,7 +28,7 @@ def module_profile_scope(
     detail: str | None = None,
 ) -> AbstractContextManager:
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
-        if detail is not None and _env_enabled("VLLM_PROFILE_LAYER_SCOPES"):
+        if detail is not None and envs.VLLM_PROFILE_LAYER_SCOPES:
             return _nested_profile_scope(name, detail)
         return record_function(name)
     return nullcontext()
@@ -45,6 +40,11 @@ def moe_profile_scope(name: str, layer_name: str) -> Iterator[None]:
         yield
         return
 
+    if not envs.VLLM_PROFILE_LAYER_SCOPES or torch.compiler.is_compiling():
+        with module_profile_scope(name, layer_name):
+            yield
+        return
+
     token = _CURRENT_MOE_LAYER.set(layer_name)
     try:
         with module_profile_scope(name, layer_name):
@@ -54,6 +54,8 @@ def moe_profile_scope(name: str, layer_name: str) -> Iterator[None]:
 
 
 def moe_comm_detail(name: str) -> str:
+    if torch.compiler.is_compiling():
+        return name
     layer_name = _CURRENT_MOE_LAYER.get()
     if layer_name is None:
         return name

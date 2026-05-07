@@ -56,18 +56,22 @@ def save_stacked_bar_plot(
 ) -> None:
     plt, academia_style = pyplot()
     fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=120)
+    fig.suptitle(title, fontproperties=academia_style.fp, y=0.98)
     bottoms = [0.0 for _ in x_values]
     for label, color, values in series:
         ax.bar(x_values, values, bottom=bottoms, label=label, color=color)
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
 
-    ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_xticks(x_values)
-    ax.legend()
-    academia_style.style_fig(fig, legend_ncol=len(series), enforce=True)
-    fig.tight_layout()
+    academia_style.style_fig(
+        fig,
+        legend_ncol=len(series),
+        enforce=True,
+        bbox_to_anchor=(0.5, 0.91),
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.80))
     fig.savefig(output_path)
     plt.close(fig)
 

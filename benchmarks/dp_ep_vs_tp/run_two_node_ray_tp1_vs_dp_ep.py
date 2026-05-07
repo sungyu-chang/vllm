@@ -47,7 +47,7 @@ REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
 MAX_MODEL_LEN = env("MAX_MODEL_LEN", "")
 ALL2ALL_BACKEND = env("ALL2ALL_BACKEND", "allgather_reducescatter")
-RESULT_ROOT = build_result_root("dp_ep_vs_tp", "two_node_ray")
+RUN_ROOT = build_result_root("two_node_ray")
 SERVER_START_TIMEOUT = int(env("SERVER_START_TIMEOUT", "900"))
 SERVER_START_RETRIES = int(env("SERVER_START_RETRIES", "3"))
 SERVER_RETRY_DELAY_SECONDS = int(env("SERVER_RETRY_DELAY_SECONDS", "10"))
@@ -67,9 +67,9 @@ RAY_DP_PACK_STRATEGY = env("VLLM_RAY_DP_PACK_STRATEGY", "strict")
 RUN_NOTES = env("RUN_NOTES", "")
 FIX_NOTES = env("FIX_NOTES", "")
 
-SERVER_LOG_DIR = RESULT_ROOT / "server_logs"
-BENCH_LOG_DIR = RESULT_ROOT / "bench_logs"
-JSON_DIR = RESULT_ROOT / "json"
+SERVER_LOG_DIR = RUN_ROOT / "server_logs"
+BENCH_LOG_DIR = RUN_ROOT / "bench_logs"
+JSON_DIR = RUN_ROOT / "json"
 
 server_proc: subprocess.Popen[bytes] | None = None
 
@@ -288,7 +288,7 @@ def summarize_results() -> None:
     if not python_path.is_file() and shutil.which(PYTHON_BIN) is None:
         print(f"Skipping summary: {PYTHON_BIN} is not executable.", file=sys.stderr)
         return
-    summary_path = RESULT_ROOT / "summary.csv"
+    summary_path = RUN_ROOT / "summary.csv"
     subprocess.run(
         [
             PYTHON_BIN,
@@ -306,7 +306,7 @@ def write_run_summary(*, status: str, started_at: str,
                       completed_at: str | None = None,
                       failure_reason: str | None = None) -> None:
     write_run_readme(
-        RESULT_ROOT,
+        RUN_ROOT,
         title="Two-node Ray TP1x2 vs DP+EP Run",
         script_path="benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py",
         status=status,
@@ -335,7 +335,7 @@ def write_run_summary(*, status: str, started_at: str,
             "disable_prefix_caching": str(DISABLE_PREFIX_CACHING).lower(),
             "python_bin": PYTHON_BIN,
             "ray_dp_pack_strategy": RAY_DP_PACK_STRATEGY,
-            "smoke_run": str(RESULT_ROOT.name.endswith("_smoke")).lower(),
+            "smoke_run": str(RUN_ROOT.name.endswith("_smoke")).lower(),
         },
         planned_cases=["tp1x2", "dp2_ep"],
         artifact_paths={
@@ -386,7 +386,7 @@ def main() -> int:
             started_at=started_at,
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
-        print(f"Results: {RESULT_ROOT}")
+        print(f"Results: {RUN_ROOT}")
         return 0
     except Exception:
         write_run_summary(
