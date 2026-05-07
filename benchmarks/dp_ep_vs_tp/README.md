@@ -57,6 +57,7 @@ explicitly overrides one of these values:
 - Server dtype: `--dtype bfloat16`.
 - Input length: `1`.
 - Output length: `256`.
+- Warmup requests: `100` per `vllm bench serve` run.
 - Request rate: `inf`.
 - Benchmark args: `--ignore-eos`.
 - Prefix caching: disabled with `--no-enable-prefix-caching`.
@@ -92,6 +93,7 @@ PATH="$(pwd)/.venv/bin:$PATH" \
   --dp-sizes "1 2 3 4 5 6 7 8" \
   --input-len 1 \
   --output-len 256 \
+  --num-warmups 100 \
   --max-concurrency-per-gpu 1001 \
   --all2all-backend allgather_reducescatter
 ```
@@ -108,21 +110,18 @@ PATH="$(pwd)/.venv/bin:$PATH" \
   --dp-sizes "1 2 3 4 5 6 7 8" \
   --input-len 1 \
   --output-len 256 \
+  --num-warmups 100 \
   --max-concurrency-per-gpu 1001 \
   --all2all-backend allgather_reducescatter
 ```
 
 The suite writes one run directory per model under:
 
+The results are written under the root repo directory.
 ```text
 results/dp_ep_vs_tp/one_node_online/<timestamp>/
 ```
 
-The combined analysis artifacts are written under:
-
-```text
-results/dp_ep_vs_tp/analysis/<timestamp>/
-```
 
 Each model run contains:
 
@@ -148,6 +147,7 @@ DP_SIZES="1 2 3 4 5 6 7 8" \
 PROMPTS_PER_GPU=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
+NUM_WARMUPS=100 \
 REQUEST_RATE=inf \
 MAX_CONCURRENCY_PER_GPU=1001 \
 ALL2ALL_BACKEND=allgather_reducescatter \
@@ -180,6 +180,7 @@ DP_SIZES="1 2 3 4 5 6 7 8" \
 PROMPTS_PER_GPU=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
+NUM_WARMUPS=100 \
 REQUEST_RATE=inf \
 MAX_CONCURRENCY_PER_GPU=1001 \
 ALL2ALL_BACKEND=allgather_reducescatter \
@@ -218,6 +219,7 @@ DP_SIZES="1 2 3 4 5 6 7 8" \
 NUM_PROMPTS=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
+NUM_WARMUPS=100 \
 REQUEST_RATE=inf \
 MAX_CONCURRENCY_PER_GPU=1001 \
 ALL2ALL_BACKEND=allgather_reducescatter \
@@ -238,6 +240,7 @@ DP_SIZES="1 2 3 4" \
 NUM_PROMPTS=1000 \
 INPUT_LEN=1 \
 OUTPUT_LEN=256 \
+NUM_WARMUPS=100 \
 REQUEST_RATE=inf \
 MAX_CONCURRENCY_PER_GPU=1001 \
 ALL2ALL_BACKEND=allgather_reducescatter \
@@ -273,6 +276,7 @@ Run:
 PATH="$(pwd)/.venv/bin:$PATH" \
 VLLM_RAY_DP_PACK_STRATEGY=strict \
 MODEL=allenai/OLMoE-1B-7B-0924-Instruct \
+NUM_WARMUPS=100 \
 SERVER_EXTRA_ARGS="--dtype float16" \
 .venv/bin/python benchmarks/dp_ep_vs_tp/run_two_node_ray_tp1_vs_dp_ep.py
 ```
@@ -352,6 +356,7 @@ NUM_PROMPTS=
 PROMPTS_PER_GPU=1000
 INPUT_LEN=1
 OUTPUT_LEN=256
+NUM_WARMUPS=100
 REQUEST_RATE=inf
 MAX_CONCURRENCY=
 MAX_CONCURRENCY_PER_GPU=
@@ -376,8 +381,9 @@ PROFILE_LAYER_SCOPES=0
 DISABLE_PREFIX_CACHING=1
 ```
 
-By default, every case uses `INPUT_LEN=1`, `OUTPUT_LEN=256`, appends
-`--ignore-eos` to `vllm bench serve`, and starts `vllm serve` with
+By default, every case uses `INPUT_LEN=1`, `OUTPUT_LEN=256`,
+`NUM_WARMUPS=100`, appends `--ignore-eos` to `vllm bench serve`, and starts
+`vllm serve` with
 `--no-enable-prefix-caching`. Unless `NUM_PROMPTS` is set explicitly, each case
 uses `PROMPTS_PER_GPU * GPUs used`; the default `PROMPTS_PER_GPU` is `1000`.
 

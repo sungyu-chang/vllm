@@ -40,6 +40,9 @@ PROMPTS_PER_GPU = int(env("PROMPTS_PER_GPU", "1000"))
 NUM_PROMPTS = env("NUM_PROMPTS", str(PROMPTS_PER_GPU * 2))
 INPUT_LEN = env("INPUT_LEN", "1")
 OUTPUT_LEN = env("OUTPUT_LEN", "256")
+NUM_WARMUPS = int(env("NUM_WARMUPS", "100"))
+if NUM_WARMUPS < 0:
+    raise SystemExit("NUM_WARMUPS must be non-negative")
 REQUEST_RATE = env("REQUEST_RATE", "inf")
 MAX_CONCURRENCY = env("MAX_CONCURRENCY", "")
 MAX_MODEL_LEN = env("MAX_MODEL_LEN", "")
@@ -240,6 +243,8 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         OUTPUT_LEN,
         "--num-prompts",
         NUM_PROMPTS,
+        "--num-warmups",
+        str(NUM_WARMUPS),
         "--request-rate",
         REQUEST_RATE,
         "--save-result",
@@ -252,6 +257,7 @@ def run_case(case_name: str, port: int, server_args: list[str]) -> None:
         f"model={MODEL}",
         "gpu_count=2",
         f"num_prompts={NUM_PROMPTS}",
+        f"num_warmups={NUM_WARMUPS}",
         f"prompts_per_gpu={PROMPTS_PER_GPU}",
         "nodes=2",
         "gpus_per_node=1",
@@ -315,6 +321,7 @@ def write_run_summary(*, status: str, started_at: str,
             "prompts_per_gpu": str(PROMPTS_PER_GPU),
             "input_len": INPUT_LEN,
             "output_len": OUTPUT_LEN,
+            "num_warmups": str(NUM_WARMUPS),
             "request_rate": REQUEST_RATE,
             "max_concurrency": MAX_CONCURRENCY or "unset",
             "max_model_len": MAX_MODEL_LEN or "vLLM default",

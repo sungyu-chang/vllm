@@ -152,6 +152,7 @@ class SingleNodeBenchmarkConfig:
     prompts_per_gpu: int = 1000
     input_len: str = "1"
     output_len: str = "256"
+    num_warmups: int = 100
     request_rate: str = "inf"
     max_concurrency: str = ""
     max_concurrency_per_gpu: str = ""
@@ -168,6 +169,10 @@ class SingleNodeBenchmarkConfig:
     profile_layer_scopes: bool = False
     disable_prefix_caching: bool = True
     port_release_timeout: int = 60
+
+    def __post_init__(self) -> None:
+        if self.num_warmups < 0:
+            raise SystemExit("NUM_WARMUPS must be non-negative")
 
     @property
     def gpu_count(self) -> int:
@@ -329,8 +334,6 @@ class SingleNodeBenchmarkRunner:
             "--port",
             str(port),
         ]
-        if self.config.max_model_len:
-            cmd.extend(["--max-model-len", self.config.max_model_len])
         if self.config.disable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
         cmd.extend(server_args)
@@ -354,6 +357,7 @@ class SingleNodeBenchmarkRunner:
             f"prompts_per_gpu={self.config.prompts_per_gpu}",
             f"input_len={self.config.input_len}",
             f"output_len={self.config.output_len}",
+            f"num_warmups={self.config.num_warmups}",
             f"profile_modules={self.config.profile_modules}",
         ]
         max_concurrency = self.config.max_concurrency_for_gpu_count(gpu_count)
@@ -388,6 +392,8 @@ class SingleNodeBenchmarkRunner:
             self.config.output_len,
             "--num-prompts",
             num_prompts,
+            "--num-warmups",
+            str(self.config.num_warmups),
             "--request-rate",
             self.config.request_rate,
             "--save-result",

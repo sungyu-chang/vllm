@@ -80,6 +80,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-len", default="1")
     parser.add_argument("--output-len", default="256")
     parser.add_argument(
+        "--num-warmups",
+        default="100",
+        help="Number of warmup requests for each vllm bench serve run.",
+    )
+    parser.add_argument(
         "--num-prompts",
         default=None,
         help="Override per-case prompt count. Defaults to 1000 * GPUs used.",
@@ -114,6 +119,7 @@ def build_run_notes(spec: ModelSpec, args: argparse.Namespace) -> str:
         f"Single-node DP+EP comparison for {spec.model_id}, "
         f"input {args.input_len}, output {args.output_len}, "
         f"prompts={args.num_prompts or '1000 * GPUs used'}, "
+        f"warmups={args.num_warmups}, "
         f"max_concurrency={args.max_concurrency or 'unset'}, "
         f"max_concurrency_per_gpu={args.max_concurrency_per_gpu or 'unset'}, "
         f"TP={tp_scope}, DP+EP={dp_scope}, ignore_eos=true, "
@@ -148,6 +154,7 @@ def run_model(spec: ModelSpec, args: argparse.Namespace) -> Path:
         "RUN_DP_EP": "1",
         "INPUT_LEN": args.input_len,
         "OUTPUT_LEN": args.output_len,
+        "NUM_WARMUPS": args.num_warmups,
         "REQUEST_RATE": args.request_rate,
         "RUN_NOTES": build_run_notes(spec, args),
         "PYTHON_BIN": str(REPO_ROOT / ".venv" / "bin" / "python"),

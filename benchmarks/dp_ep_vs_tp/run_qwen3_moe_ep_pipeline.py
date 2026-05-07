@@ -98,6 +98,7 @@ def make_config(
         prompts_per_gpu=int(env("PROMPTS_PER_GPU", "1000")),
         input_len=env("INPUT_LEN", "1"),
         output_len=env("OUTPUT_LEN", "256"),
+        num_warmups=int(env("NUM_WARMUPS", "100")),
         request_rate=env("REQUEST_RATE", "inf"),
         max_concurrency=env("MAX_CONCURRENCY", ""),
         max_concurrency_per_gpu=env("MAX_CONCURRENCY_PER_GPU", ""),
