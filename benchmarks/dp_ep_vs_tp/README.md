@@ -167,6 +167,87 @@ results/dp_ep_vs_tp/qwen3_moe_ep_pipeline/YYYY-MM-DD_HH-MM-SS/
 - `throughput/server_logs/<case>.log`
 - `throughput/bench_logs/<case>.log`
 
+To capture Nsight Systems traces for the same DP+EP execution shape, use the
+dedicated nsys harness. It wraps each `vllm serve` case in `nsys profile`, uses
+full server-lifetime capture by default, and writes one profile output base per
+DP+EP case:
+
+```bash
+PATH="$(pwd)/.venv/bin:$PATH" \
+MODEL=Qwen/Qwen3-30B-A3B \
+SERVER_EXTRA_ARGS="--dtype bfloat16" \
+GPU_COUNT=8 \
+PROMPTS_PER_GPU=1000 \
+INPUT_LEN=1 \
+OUTPUT_LEN=256 \
+NUM_WARMUPS=100 \
+REQUEST_RATE=inf \
+MAX_CONCURRENCY_PER_GPU=1001 \
+ALL2ALL_BACKEND=allgather_reducescatter \
+.venv/bin/python benchmarks/dp_ep_vs_tp/run_qwen3_moe_ep_nsys.py
+```
+
+The nsys run writes:
+
+```text
+results/dp_ep_vs_tp/nsys_profiling/YYYY-MM-DD_HH-MM-SS/
+```
+
+- `nsys/<case>.nsys-rep`
+- `nsys_stats/<case>.*_cuda_gpu_kern_sum.csv`
+- `nsys_stats/<case>.*_cuda_gpu_trace.csv`
+- `summary.csv`
+- `json/<case>.json`
+- `server_logs/<case>.log`
+- `bench_logs/<case>.log`
+
+Set `NSYS_BIN` when `nsys` is not on `PATH`. The script also checks the common
+Nsight Systems CLI path `/opt/nvidia/nsight-systems-cli/2026.2.1/bin/nsys`.
+The `qwen15-moe-nsys-profile` just target sets `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1` because both the server and benchmark client reuse the
+cached model/tokenizer, and online Hugging Face checks can otherwise stall the
+client before traffic begins. It also sets
+`NSYS_CAPTURE_RANGE=cudaProfilerApi`, `NSYS_CAPTURE_RANGE_END=stop`,
+`NSYS_CAPTURE_TIMEOUT=300`, and `NSYS_CUDA_GRAPH_TRACE=node` so the default
+Qwen1.5-MoE nsys run captures only the benchmark range, expands CUDA graph nodes
+in the timeline, and aborts the benchmark/profile capture if it runs longer than
+five minutes.
+Use `NSYS_TRACE` to override the default `cuda,nvtx` trace set, and
+`NSYS_EXTRA_ARGS` to override the default extra `nsys profile` flags. By
+default, the harness adds
+`--sample=none --backtrace=none --resolve-symbols=false` so report import stays
+focused on CUDA/NVTX data and does not block on CPU symbol resolution/downloads.
+By default,
+`NSYS_CAPTURE_RANGE=none`, so `vllm bench serve` does not call `/start_profile`
+or `/stop_profile`; this avoids CUDA profiler API shutdown stalls while still
+capturing CUDA kernels in the `.nsys-rep`. Set
+`NSYS_CAPTURE_RANGE=cudaProfilerApi` to opt into bounded CUDA profiler API
+capture for custom runs. Ranged capture starts `vllm serve` with
+`--profiler-config '{"profiler":"cuda"}'` and adds `--profile` to
+`vllm bench serve`, which makes the benchmark client call the server's
+`/start_profile` endpoint before traffic and `/stop_profile` after traffic. If
+the benchmark/profile subprocess exceeds `NSYS_CAPTURE_TIMEOUT`, the harness
+kills that subprocess and then cleans up the server and nsys process groups.
+CUDA kernel summaries require the default `NSYS_TRACE=cuda,nvtx`; CUDA graph
+node tracing is controlled with `NSYS_CUDA_GRAPH_TRACE=node`. The nsys harness
+runs the profiler and server in separate process groups and defaults to
+`NSYS_WAIT=all` so multiprocess DP traces can finish writing all child process
+data. On cleanup, it sends SIGINT to discovered server process groups without
+interrupting the Nsight Systems process first; if reparented DP workers linger,
+it terminates those server groups before sending SIGINT to the nsys root process
+group to flush the report. `NSYS_SERVER_EXIT_TIMEOUT` controls the graceful
+server-process wait before escalation. `NSYS_FLUSH_DELAY` controls the grace
+period between server exit and nsys SIGINT; the default is 90 seconds because
+interrupting nsys immediately after vLLM exits can leave an incomplete qdstrm
+stream. It waits up to
+`NSYS_SERVER_SHUTDOWN_TIMEOUT` seconds for nsys to write the report. The
+default is 300 seconds because multiprocess DP traces can take several minutes
+to finalize but should not hang indefinitely. It
+keeps `--enforce-eager` disabled and fails early if it is included in
+`SERVER_EXTRA_ARGS`. By default it also runs `nsys stats` after each case to
+export `cuda_gpu_kern_sum` and `cuda_gpu_trace` CSV files. Override the report
+list with `NSYS_STATS_REPORTS`.
+
 ### Case 3: DP+EP Performance With Profiling
 
 This case repeats the DP+EP sweep with module profiling enabled. Use it to
