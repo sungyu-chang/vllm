@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,6 +17,8 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import psutil
 
@@ -35,10 +39,83 @@ from benchmarks.dp_ep_vs_tp.single_node_common import (
 )
 
 DEFAULT_NSYS_BIN = "/opt/nvidia/nsight-systems-cli/2026.2.1/bin/nsys"
+CLI_ARGS: argparse.Namespace | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run one-node Qwen MoE DP+EP benchmarks under Nsight Systems."
+    )
+    parser.add_argument("--model")
+    parser.add_argument("--server-extra-args")
+    parser.add_argument("--gpu-count", type=int)
+    parser.add_argument("--gpu-ids")
+    parser.add_argument("--dp-sizes")
+    parser.add_argument("--prompts-per-gpu", type=int)
+    parser.add_argument("--input-len")
+    parser.add_argument("--output-len")
+    parser.add_argument("--num-warmups", type=int)
+    parser.add_argument("--request-rate")
+    parser.add_argument("--max-concurrency-per-gpu")
+    parser.add_argument("--all2all-backend")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--nsys-bin")
+    parser.add_argument("--nsys-trace")
+    parser.add_argument("--nsys-wait")
+    parser.add_argument("--nsys-extra-args")
+    parser.add_argument("--capture-range")
+    parser.add_argument("--capture-range-end")
+    parser.add_argument("--duration", type=int)
+    parser.add_argument("--capture-timeout", type=int)
+    parser.add_argument("--cuda-graph-trace")
+    parser.add_argument("--stop-profile-timeout", type=int)
+    parser.add_argument("--stats-reports")
+    parser.add_argument("--report-timeout", type=int)
+    parser.add_argument("--server-shutdown-timeout", type=int)
+    parser.add_argument("--server-exit-timeout", type=int)
+    parser.add_argument("--server-terminate-timeout", type=int)
+    parser.add_argument("--flush-delay", type=int)
+    return parser.parse_args()
+
+
+def cli_or_env(name: str, env_name: str, default: str) -> str:
+    if CLI_ARGS is not None:
+        value = getattr(CLI_ARGS, name)
+        if value is not None:
+            return str(value)
+    return env(env_name, default)
+
+
+def cli_int_or_env(name: str, env_name: str, default: str) -> int:
+    return int(cli_or_env(name, env_name, default))
+
+
+def apply_cli_env_overrides(args: argparse.Namespace) -> None:
+    overrides = {
+        "model": "MODEL",
+        "server_extra_args": "SERVER_EXTRA_ARGS",
+        "gpu_count": "GPU_COUNT",
+        "gpu_ids": "GPU_IDS",
+        "dp_sizes": "DP_SIZES",
+        "prompts_per_gpu": "PROMPTS_PER_GPU",
+        "input_len": "INPUT_LEN",
+        "output_len": "OUTPUT_LEN",
+        "num_warmups": "NUM_WARMUPS",
+        "request_rate": "REQUEST_RATE",
+        "max_concurrency_per_gpu": "MAX_CONCURRENCY_PER_GPU",
+        "all2all_backend": "ALL2ALL_BACKEND",
+    }
+    for arg_name, env_name in overrides.items():
+        value = getattr(args, arg_name)
+        if value is not None:
+            os.environ[env_name] = str(value)
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 def resolve_nsys_bin() -> str:
-    configured = env("NSYS_BIN", "")
+    configured = cli_or_env("nsys_bin", "NSYS_BIN", "")
     if configured:
         return configured
     nsys_on_path = shutil.which("nsys")
@@ -57,12 +134,12 @@ def validate_enforce_eager_disabled(server_extra_args: list[str]) -> None:
     if "--enforce-eager" in server_extra_args:
         raise SystemExit(
             "Nsight Systems profiling should run with enforce eager disabled. "
-            "Remove --enforce-eager from SERVER_EXTRA_ARGS."
+            "Remove --enforce-eager from --server-extra-args."
         )
 
 
 def nsys_capture_range() -> str:
-    return env("NSYS_CAPTURE_RANGE", "none")
+    return cli_or_env("capture_range", "NSYS_CAPTURE_RANGE", "none")
 
 
 def use_vllm_profile_endpoint() -> bool:
@@ -70,18 +147,27 @@ def use_vllm_profile_endpoint() -> bool:
 
 
 def nsys_wait_mode() -> str:
-    return env("NSYS_WAIT", "all")
+    return cli_or_env("nsys_wait", "NSYS_WAIT", "all")
 
 
 def nsys_extra_args() -> list[str]:
     default_args = "--sample=none --backtrace=none --resolve-symbols=false"
-    return shlex_env("NSYS_EXTRA_ARGS", default_args)
+    return shlex.split(cli_or_env("nsys_extra_args", "NSYS_EXTRA_ARGS", default_args))
+
+
+def nsys_duration() -> int | None:
+    duration = cli_int_or_env("duration", "NSYS_DURATION", "0")
+    return duration if duration > 0 else None
 
 
 def nsys_capture_timeout() -> int | None:
     default_timeout = "300" if use_vllm_profile_endpoint() else "0"
-    timeout = int(env("NSYS_CAPTURE_TIMEOUT", default_timeout))
+    timeout = cli_int_or_env("capture_timeout", "NSYS_CAPTURE_TIMEOUT", default_timeout)
     return timeout if timeout > 0 else None
+
+
+def stop_profile_timeout() -> int:
+    return cli_int_or_env("stop_profile_timeout", "NSYS_STOP_PROFILE_TIMEOUT", "30")
 
 
 def build_config(*, result_root: Path, gpu_ids: list[str]) -> SingleNodeBenchmarkConfig:
@@ -133,7 +219,7 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
         super().require_command(command)
         if shutil.which(self.nsys_bin) is None and not Path(self.nsys_bin).is_file():
             raise SystemExit(
-                f"nsys command not found: {self.nsys_bin}. Set NSYS_BIN to the "
+                f"nsys command not found: {self.nsys_bin}. Pass --nsys-bin with the "
                 "full Nsight Systems CLI path."
             )
 
@@ -148,18 +234,24 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
             "--output",
             str(output_base.resolve()),
             "--trace",
-            env("NSYS_TRACE", "cuda,nvtx"),
+            cli_or_env("nsys_trace", "NSYS_TRACE", "cuda,nvtx"),
             *nsys_extra_args(),
             *server_cmd,
         ]
-        cuda_graph_trace = env("NSYS_CUDA_GRAPH_TRACE", "")
+        cuda_graph_trace = cli_or_env("cuda_graph_trace", "NSYS_CUDA_GRAPH_TRACE", "")
         if cuda_graph_trace:
             cmd[4:4] = [f"--cuda-graph-trace={cuda_graph_trace}"]
+        duration = nsys_duration()
+        if duration is not None:
+            cmd[4:4] = [f"--duration={duration}"]
         capture_range = nsys_capture_range()
         if capture_range != "none":
+            capture_range_end = cli_or_env(
+                "capture_range_end", "NSYS_CAPTURE_RANGE_END", "repeat"
+            )
             cmd[4:4] = [
                 f"--capture-range={capture_range}",
-                f"--capture-range-end={env('NSYS_CAPTURE_RANGE_END', 'repeat')}",
+                f"--capture-range-end={capture_range_end}",
             ]
         return cmd
 
@@ -174,24 +266,48 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
         metadata = {
             **metadata,
             "nsys": True,
-            "nsys_trace": env("NSYS_TRACE", "cuda,nvtx"),
+            "nsys_trace": cli_or_env("nsys_trace", "NSYS_TRACE", "cuda,nvtx"),
             "nsys_capture_range": nsys_capture_range(),
             "nsys_capture_timeout": nsys_capture_timeout() or "none",
+            "nsys_duration": nsys_duration() or "none",
         }
         cmd = super().build_bench_cmd(case_name, port, gpu_count, metadata)
         if use_vllm_profile_endpoint() and "--profile" not in cmd:
             cmd.append("--profile")
         return cmd
 
+    def stop_profile(self, port: int, log) -> None:
+        if not use_vllm_profile_endpoint():
+            return
+        profile_url = f"http://{self.config.host}:{port}/stop_profile"
+        request = Request(profile_url, method="POST")
+        try:
+            with urlopen(request, timeout=stop_profile_timeout()) as response:
+                log.write(
+                    "\nForced /stop_profile returned "
+                    f"HTTP {response.status}.\n".encode()
+                )
+        except (TimeoutError, URLError, OSError) as exc:
+            log.write(
+                "\nFailed to force /stop_profile before cleanup: "
+                f"{exc!r}\n".encode()
+            )
+
     def cleanup_server(self) -> None:
         proc = self.server_proc
         if proc is None:
             return
 
-        shutdown_timeout = int(env("NSYS_SERVER_SHUTDOWN_TIMEOUT", "300"))
-        server_exit_timeout = int(env("NSYS_SERVER_EXIT_TIMEOUT", "60"))
-        flush_delay = int(env("NSYS_FLUSH_DELAY", "90"))
-        terminate_timeout = int(env("NSYS_SERVER_TERMINATE_TIMEOUT", "60"))
+        shutdown_timeout = cli_int_or_env(
+            "server_shutdown_timeout", "NSYS_SERVER_SHUTDOWN_TIMEOUT", "300"
+        )
+        server_exit_timeout = cli_int_or_env(
+            "server_exit_timeout", "NSYS_SERVER_EXIT_TIMEOUT", "60"
+        )
+        flush_delay = cli_int_or_env("flush_delay", "NSYS_FLUSH_DELAY", "90")
+        terminate_timeout = cli_int_or_env(
+            "server_terminate_timeout", "NSYS_SERVER_TERMINATE_TIMEOUT", "60"
+        )
         server_process_groups = set(self.server_process_group_snapshot)
         server_process_groups.update(self.server_process_groups(proc.pid))
         nsys_process_groups = self.nsys_process_groups(proc.pid)
@@ -208,7 +324,9 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
             self.terminate_process_groups(server_process_groups, terminate_timeout)
 
         time.sleep(flush_delay)
-        self.signal_process_groups(self.nsys_root_process_group(proc.pid), signal.SIGINT)
+        self.signal_process_groups(
+            self.nsys_root_process_group(proc.pid), signal.SIGINT
+        )
         try:
             proc.wait(timeout=shutdown_timeout)
         except subprocess.TimeoutExpired:
@@ -319,7 +437,7 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
                 continue
 
     def wait_for_nsys_reports(self, case_name: str) -> list[Path]:
-        timeout = int(env("NSYS_REPORT_TIMEOUT", "900"))
+        timeout = cli_int_or_env("report_timeout", "NSYS_REPORT_TIMEOUT", "900")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             report_files = sorted(self.nsys_dir.glob(f"{case_name}*.nsys-rep"))
@@ -329,7 +447,9 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
         raise RuntimeError(f"Missing Nsight Systems report for case: {case_name}")
 
     def export_nsys_stats(self, case_name: str) -> None:
-        reports = env("NSYS_STATS_REPORTS", "cuda_gpu_kern_sum,cuda_gpu_trace")
+        reports = cli_or_env(
+            "stats_reports", "NSYS_STATS_REPORTS", "cuda_gpu_kern_sum,cuda_gpu_trace"
+        )
         report_files = self.wait_for_nsys_reports(case_name)
 
         for report_file in report_files:
@@ -391,7 +511,9 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
             )
 
         self.wait_for_server(port, server_log)
-        self.server_process_group_snapshot = self.server_process_groups(self.server_proc.pid)
+        self.server_process_group_snapshot = self.server_process_groups(
+            self.server_proc.pid
+        )
         bench_cmd = self.build_bench_cmd(case_name, port, gpu_count, metadata)
 
         try:
@@ -409,6 +531,7 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
                         f"\nTimed out after {exc.timeout} seconds while running "
                         "the benchmark/profile capture.\n".encode()
                     )
+                    self.stop_profile(port, log)
                     raise RuntimeError(
                         f"Timed out after {exc.timeout} seconds while running "
                         f"Nsight Systems ranged capture for case: {case_name}"
@@ -466,21 +589,34 @@ def write_run_summary(
             "bench_extra_args": " ".join(config.bench_extra_args) or "(none)",
             "python_bin": config.python_bin,
             "nsys_bin": nsys_bin,
-            "nsys_trace": env("NSYS_TRACE", "cuda,nvtx"),
+            "nsys_trace": cli_or_env("nsys_trace", "NSYS_TRACE", "cuda,nvtx"),
             "nsys_capture_range": nsys_capture_range(),
-            "nsys_capture_range_end": env("NSYS_CAPTURE_RANGE_END", "repeat"),
+            "nsys_capture_range_end": cli_or_env(
+                "capture_range_end", "NSYS_CAPTURE_RANGE_END", "repeat"
+            ),
             "nsys_capture_timeout": str(nsys_capture_timeout() or "none"),
-            "nsys_cuda_graph_trace": env("NSYS_CUDA_GRAPH_TRACE", "") or "unset",
+            "nsys_duration": str(nsys_duration() or "none"),
+            "nsys_cuda_graph_trace": cli_or_env(
+                "cuda_graph_trace", "NSYS_CUDA_GRAPH_TRACE", ""
+            )
+            or "unset",
             "nsys_wait": nsys_wait_mode(),
             "vllm_profile_endpoint": str(use_vllm_profile_endpoint()).lower(),
             "nsys_extra_args": " ".join(nsys_extra_args()) or "(none)",
-            "nsys_stats_reports": env(
+            "nsys_stats_reports": cli_or_env(
+                "stats_reports",
                 "NSYS_STATS_REPORTS", "cuda_gpu_kern_sum,cuda_gpu_trace"
             ),
-            "nsys_server_shutdown_timeout": env("NSYS_SERVER_SHUTDOWN_TIMEOUT", "300"),
-            "nsys_flush_delay": env("NSYS_FLUSH_DELAY", "90"),
-            "nsys_server_terminate_timeout": env("NSYS_SERVER_TERMINATE_TIMEOUT", "60"),
-            "nsys_report_timeout": env("NSYS_REPORT_TIMEOUT", "900"),
+            "nsys_server_shutdown_timeout": cli_or_env(
+                "server_shutdown_timeout", "NSYS_SERVER_SHUTDOWN_TIMEOUT", "300"
+            ),
+            "nsys_flush_delay": cli_or_env("flush_delay", "NSYS_FLUSH_DELAY", "90"),
+            "nsys_server_terminate_timeout": cli_or_env(
+                "server_terminate_timeout", "NSYS_SERVER_TERMINATE_TIMEOUT", "60"
+            ),
+            "nsys_report_timeout": cli_or_env(
+                "report_timeout", "NSYS_REPORT_TIMEOUT", "900"
+            ),
             "enforce_eager": "false",
             "vllm_worker_multiproc_method": env(
                 "VLLM_WORKER_MULTIPROC_METHOD", "spawn"
@@ -504,6 +640,10 @@ def write_run_summary(
 
 
 def main() -> int:
+    global CLI_ARGS
+    CLI_ARGS = parse_args()
+    apply_cli_env_overrides(CLI_ARGS)
+
     gpu_ids = detect_gpu_ids()
     gpu_count = len(gpu_ids)
     dp_sizes = configured_sizes("DP_SIZES", default_dp_sizes(gpu_count))
