@@ -194,8 +194,6 @@ results/dp_ep_vs_tp/nsys_profiling/YYYY-MM-DD_HH-MM-SS/
 ```
 
 - `nsys/<case>.nsys-rep`
-- `nsys_stats/<case>.*_cuda_gpu_kern_sum.csv`
-- `nsys_stats/<case>.*_cuda_gpu_trace.csv`
 - `summary.csv`
 - `json/<case>.json`
 - `server_logs/<case>.log`
@@ -246,9 +244,10 @@ stream. It waits up to `--server-shutdown-timeout` seconds for nsys to write
 the report; the default is 300 seconds because multiprocess DP traces can take
 several minutes to finalize but should not hang indefinitely. It
 keeps `--enforce-eager` disabled and fails early if it is included in
-`--server-extra-args`. By default it also runs `nsys stats` after each case to
-export `cuda_gpu_kern_sum` and `cuda_gpu_trace` CSV files. Override the report
-list with `--stats-reports`.
+`--server-extra-args`. By default it does not run `nsys stats`; each case only
+waits for the `.nsys-rep` report. Pass `--export-stats` or set
+`NSYS_EXPORT_STATS=1` to export `cuda_gpu_kern_sum` and `cuda_gpu_trace` CSV
+files under `nsys_stats/`. Override that report list with `--stats-reports`.
 
 ### Case 3: DP+EP Performance With Profiling
 

@@ -69,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-timeout", type=int)
     parser.add_argument("--cuda-graph-trace")
     parser.add_argument("--stop-profile-timeout", type=int)
+    parser.add_argument("--export-stats", action="store_true")
     parser.add_argument("--stats-reports")
     parser.add_argument("--report-timeout", type=int)
     parser.add_argument("--server-shutdown-timeout", type=int)
@@ -88,6 +89,11 @@ def cli_or_env(name: str, env_name: str, default: str) -> str:
 
 def cli_int_or_env(name: str, env_name: str, default: str) -> int:
     return int(cli_or_env(name, env_name, default))
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env(name, "1" if default else "0").lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def apply_cli_env_overrides(args: argparse.Namespace) -> None:
@@ -170,6 +176,12 @@ def stop_profile_timeout() -> int:
     return cli_int_or_env("stop_profile_timeout", "NSYS_STOP_PROFILE_TIMEOUT", "30")
 
 
+def export_nsys_stats_enabled() -> bool:
+    if CLI_ARGS is not None and CLI_ARGS.export_stats:
+        return True
+    return env_bool("NSYS_EXPORT_STATS")
+
+
 def build_config(*, result_root: Path, gpu_ids: list[str]) -> SingleNodeBenchmarkConfig:
     server_extra_args = shlex_env("SERVER_EXTRA_ARGS", "--dtype bfloat16")
     validate_enforce_eager_disabled(server_extra_args)
@@ -213,7 +225,8 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
     def setup_dirs(self) -> None:
         super().setup_dirs()
         self.nsys_dir.mkdir(parents=True, exist_ok=True)
-        self.nsys_stats_dir.mkdir(parents=True, exist_ok=True)
+        if export_nsys_stats_enabled():
+            self.nsys_stats_dir.mkdir(parents=True, exist_ok=True)
 
     def require_command(self, command: str) -> None:
         super().require_command(command)
@@ -544,7 +557,9 @@ class NsysDpEpRunner(SingleNodeBenchmarkRunner):
 
         if not result_json.is_file() or result_json.stat().st_size == 0:
             raise RuntimeError(f"Missing benchmark result JSON: {result_json}")
-        self.export_nsys_stats(case_name)
+        self.wait_for_nsys_reports(case_name)
+        if export_nsys_stats_enabled():
+            self.export_nsys_stats(case_name)
         print(f"Nsight Systems output base: {self.nsys_dir / case_name}", flush=True)
 
 
@@ -603,6 +618,7 @@ def write_run_summary(
             "nsys_wait": nsys_wait_mode(),
             "vllm_profile_endpoint": str(use_vllm_profile_endpoint()).lower(),
             "nsys_extra_args": " ".join(nsys_extra_args()) or "(none)",
+            "nsys_export_stats": str(export_nsys_stats_enabled()).lower(),
             "nsys_stats_reports": cli_or_env(
                 "stats_reports",
                 "NSYS_STATS_REPORTS", "cuda_gpu_kern_sum,cuda_gpu_trace"
@@ -627,7 +643,6 @@ def write_run_summary(
         planned_cases=[f"dp{dp_size}_ep" for dp_size in dp_sizes],
         artifact_paths={
             "nsys reports": "nsys/",
-            "nsys stats": "nsys_stats/",
             "server logs": "server_logs/",
             "bench logs": "bench_logs/",
             "json results": "json/",
