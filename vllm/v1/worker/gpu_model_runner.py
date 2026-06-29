@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -193,6 +195,31 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _is_cudagraph_measurement_enabled() -> bool:
+    value = os.getenv("VLLM_PROFILE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _get_cudagraph_measurement_path() -> str | None:
+    explicit_path = os.getenv("VLLM_CUDAGRAPH_MEASUREMENT_PATH", "").strip()
+    if explicit_path:
+        return explicit_path
+    if not _is_cudagraph_measurement_enabled():
+        return None
+    return os.path.join("profiles", "cudagraph_measurements.jsonl")
+
+
+def _append_cudagraph_measurement(event: str, **payload: Any) -> None:
+    path = _get_cudagraph_measurement_path()
+    if not path:
+        return
+    record = {"event": event, **payload}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -5192,6 +5219,15 @@ class GPUModelRunner(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
+            if is_global_first_rank() and _is_cudagraph_measurement_enabled():
+                _append_cudagraph_measurement(
+                    "capture_skipped",
+                    model=self.model_config.model,
+                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                    runtime_mode="NONE",
+                    num_graphs=0,
+                    memory_gib=0.0,
+                )
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
@@ -5247,6 +5283,16 @@ class GPUModelRunner(
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        if is_global_first_rank() and _is_cudagraph_measurement_enabled():
+            num_graphs = len(self.compilation_config.cudagraph_capture_sizes)
+            _append_cudagraph_measurement(
+                "capture_completed",
+                model=self.model_config.model,
+                tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                num_graphs=num_graphs,
+                memory_gib=cuda_graph_size / (1 << 30),
+                elapsed_s=elapsed_time,
+            )
         # This usually takes 5~20 seconds.
         logger.info_once(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
@@ -5325,6 +5371,19 @@ class GPUModelRunner(
                 )
 
             # Capture run
+            if is_global_first_rank() and _is_cudagraph_measurement_enabled():
+                _append_cudagraph_measurement(
+                    "capture_batch_start",
+                    model=self.model_config.model,
+                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                    runtime_mode=cudagraph_runtime_mode.name,
+                    num_tokens=num_tokens,
+                    num_graphs=len(self.compilation_config.cudagraph_capture_sizes),
+                )
+                torch.cuda.synchronize()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
             dummy_run(
                 num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -5332,6 +5391,19 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 is_graph_capturing=True,
             )
+            if is_global_first_rank() and _is_cudagraph_measurement_enabled():
+                end_event.record()
+                torch.cuda.synchronize()
+                capture_ms_gpu = start_event.elapsed_time(end_event)
+                _append_cudagraph_measurement(
+                    "capture_batch_completed",
+                    model=self.model_config.model,
+                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                    runtime_mode=cudagraph_runtime_mode.name,
+                    num_tokens=num_tokens,
+                    num_graphs=len(self.compilation_config.cudagraph_capture_sizes),
+                    capture_ms_gpu=capture_ms_gpu,
+                )
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
