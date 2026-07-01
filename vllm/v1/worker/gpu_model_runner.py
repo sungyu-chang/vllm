@@ -5283,6 +5283,7 @@ class GPUModelRunner(
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        free_memory_delta = end_free_gpu_memory - start_free_gpu_memory
         if is_global_first_rank() and _is_cudagraph_measurement_enabled():
             num_graphs = len(self.compilation_config.cudagraph_capture_sizes)
             _append_cudagraph_measurement(
@@ -5290,7 +5291,10 @@ class GPUModelRunner(
                 model=self.model_config.model,
                 tensor_parallel_size=self.parallel_config.tensor_parallel_size,
                 num_graphs=num_graphs,
-                memory_gib=cuda_graph_size / (1 << 30),
+                memory_gib=free_memory_delta / (1 << 30),
+                free_memory_before_gib=start_free_gpu_memory / (1 << 30),
+                free_memory_after_gib=end_free_gpu_memory / (1 << 30),
+                allocation_delta_gib=cuda_graph_size / (1 << 30),
                 elapsed_s=elapsed_time,
             )
         # This usually takes 5~20 seconds.
